@@ -1,0 +1,110 @@
+# El programa del ordenador del local: se compila y se prueba en Windows de verdad (impresora de prueba que escribe a un
+# archivo: se comprueba que los bytes llegan tal cual, la tarea de arranque y quitarlo), se compila para Mac y, al
+# etiquetar una versión (v0.3.0…), se publica en Releases (los enlaces de la oficina apuntan a la última).
+name: Programa del ordenador
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Compilar
+        run: bun build ./tpvlucrapp-agente.mjs --compile --target=bun-windows-x64 --outfile tpvlucrapp-agente-windows.exe
+      - name: Impresora de prueba (lo que recibe va a un archivo)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\salida | Out-Null
+          Add-PrinterDriver -Name "Generic / Text Only"
+          Add-PrinterPort -Name "C:\salida\ticket.prn"
+          Add-Printer -Name "Ticket de prueba" -DriverName "Generic / Text Only" -PortName "C:\salida\ticket.prn"
+      - name: Ve las impresoras de Windows
+        shell: pwsh
+        run: |
+          $salida = .\tpvlucrapp-agente-windows.exe --impresoras | Out-String
+          $salida
+          if (-not $salida.Contains("Ticket de prueba")) { throw "no ve la impresora de prueba" }
+      - name: Instalar en segundo plano
+        run: .\tpvlucrapp-agente-windows.exe --instalar
+      - name: Tarea de arranque, programa y ayudante en su sitio
+        shell: pwsh
+        run: |
+          schtasks /Query /TN "TPV Lucrapp Agente" /V /FO LIST
+          if ($LASTEXITCODE -ne 0) { throw "no se creó la tarea de arranque" }
+          if (-not (Test-Path "C:\Program Files\TPV Lucrapp\tpvlucrapp-agente.exe")) { throw "falta el programa instalado" }
+          if (-not (Test-Path "C:\Program Files\TPV Lucrapp\rawprint.exe")) { throw "falta el ayudante de impresión" }
+      - name: Imprimir tal cual en la impresora de Windows
+        run: .\tpvlucrapp-agente-windows.exe --probar-impresora "Ticket de prueba"
+      - name: Llegaron los bytes ESC/POS
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 20 -and -not (Test-Path C:\salida\ticket.prn); $i++) { Start-Sleep -Seconds 1 }
+          Start-Sleep -Seconds 2
+          $bytes = [IO.File]::ReadAllBytes("C:\salida\ticket.prn")
+          if ($bytes.Length -lt 20) { throw "no se imprimió nada" }
+          if ($bytes[0] -ne 0x1B -or $bytes[1] -ne 0x40) { throw "no empieza por ESC @ (no llegó tal cual)" }
+          $texto = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+          if (-not $texto.Contains("TPV LUCRAPP")) { throw "falta el texto de la prueba" }
+          "Bien: $($bytes.Length) bytes tal cual"
+      - name: Quitarlo
+        shell: pwsh
+        run: |
+          .\tpvlucrapp-agente-windows.exe --desinstalar
+          schtasks /Query /TN "TPV Lucrapp Agente" 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "la tarea sigue ahí" }
+          if (Test-Path "C:\Program Files\TPV Lucrapp") { throw "la carpeta sigue ahí" }
+          $global:LASTEXITCODE = 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: tpvlucrapp-agente-windows.exe
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Compilar (chip Apple e Intel)
+        run: |
+          bun build ./tpvlucrapp-agente.mjs --compile --target=bun-darwin-arm64 --outfile apple/tpvlucrapp-agente
+          bun build ./tpvlucrapp-agente.mjs --compile --target=bun-darwin-x64 --outfile intel/tpvlucrapp-agente
+          ./apple/tpvlucrapp-agente --version
+          ./apple/tpvlucrapp-agente --impresoras
+          (cd apple && zip -q ../tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente)
+          (cd intel && zip -q ../tpvlucrapp-agente-mac-intel.zip tpvlucrapp-agente)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: tpvlucrapp-agente-mac-*.zip
+
+  publicar:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publicar en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Programa del ordenador ${GITHUB_REF_NAME#v}" \
+            --notes "Se instala una vez y arranca solo con el ordenador; imprime en las impresoras instaladas en Windows o Mac y en las de red por IP." \
+            tpvlucrapp-agente-windows.exe tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente-mac-intel.zip

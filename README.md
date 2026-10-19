@@ -1,24 +1,51 @@
-# Agente de impresión de TPV Lucrapp
+# Programa del ordenador de TPV Lucrapp
 
-Un programa pequeño que corre en un ordenador del local y manda a las impresoras de tickets en red (ESC/POS, puerto 9100)
-lo que la caja de **TPV Lucrapp** deja en la cola: comandas, tickets, informes de cierre, apertura del cajón y pruebas.
+El programa que se instala **una vez** en un ordenador del local y se queda funcionando en segundo plano: arranca solo
+cada vez que se enciende el ordenador, sin ventanas. Manda a las impresoras lo que la caja de **TPV Lucrapp** deja en la
+cola (comandas, tickets, informes de cierre, apertura del cajón y pruebas):
 
-## Instalación (sin instalar nada más)
+- a las **impresoras instaladas en el ordenador** (USB o de red, las que ve Windows o Mac), por su propia cola de impresión;
+- o a **impresoras de red por IP** (ESC/POS, puerto 9100).
 
-1. Descarga el programa de la última versión en **Releases** (a la derecha):
-   `tpvlucrapp-agente-windows.exe` (Windows), `tpvlucrapp-agente-mac-apple-silicon.zip` (Mac con chip Apple) o
-   `tpvlucrapp-agente-mac-intel.zip` (Mac con Intel). En Mac, descomprime el zip.
-2. En la oficina de TPV Lucrapp → **Impresión y pantallas** → **Agente de impresión** → «Nuevo agente», copia el código de enlace.
-3. Abre el programa y pega el código. Lo guarda en un archivo `agente.json` a su lado y a partir de ahí arranca solo.
-   Déjalo abierto (o ponlo en los programas de inicio): la oficina lo verá «en línea».
+Y le cuenta a la oficina qué impresoras tiene el ordenador, para darlas de alta con un toque.
+
+## Instalación
+
+1. En la oficina de TPV Lucrapp → **Impresión y pantallas** → **Conectar un ordenador**: ponle un nombre y te dará un
+   código (por ejemplo `K7PQ-4XMW`, vale una vez y caduca en una hora).
+2. En ese ordenador, descarga el programa de la última versión en **Releases**: `tpvlucrapp-agente-windows.exe`
+   (Windows), `tpvlucrapp-agente-mac-apple-silicon.zip` (Mac con chip Apple) o `tpvlucrapp-agente-mac-intel.zip` (Mac con
+   Intel; descomprime el zip).
+3. Ábrelo y escribe el código. En Windows pide permiso de administrador una vez («Sí»): lo necesita para arrancar solo con
+   el ordenador. Listo: no hay que volver a abrir nada.
+4. En la oficina → **Añadir impresora** salen las impresoras de ese ordenador: elige cuáles usar.
 
 - Windows avisa «Windows protegió tu PC» la primera vez: **Más información → Ejecutar de todas formas** (el programa aún no va firmado).
-- Mac avisa de que no puede comprobarlo: Ajustes del Sistema → **Privacidad y seguridad** → «Abrir de todos modos».
+- Mac avisa de que no puede comprobarlo: clic derecho → **Abrir**, o Ajustes del Sistema → **Privacidad y seguridad** → «Abrir de todos modos».
 
-Probar una impresora sin pasar por la caja: `tpvlucrapp-agente --probar 192.168.1.50:9100`.
+## Dónde queda
+
+| | Windows | Mac |
+| --- | --- | --- |
+| Programa | `C:\Program Files\TPV Lucrapp\` (con `rawprint.exe`, el ayudante que imprime tal cual) | `~/Library/Application Support/TPV Lucrapp/` |
+| Arranque | Tarea «TPV Lucrapp Agente»: al encender, como SYSTEM, se reinicia si se cae | `~/Library/LaunchAgents/com.tpvlucrapp.agente.plist` |
+| Enlace y registro | `C:\ProgramData\TPV Lucrapp\agente.json` y `agente.log` | `agente.json` y `agente.log` en la carpeta del programa |
+
+## Órdenes
+
+```
+tpvlucrapp-agente                                    instalar o ver el estado (con doble clic)
+tpvlucrapp-agente --impresoras                       las impresoras que ve este ordenador
+tpvlucrapp-agente --probar 192.168.1.50:9100         prueba en una impresora de red
+tpvlucrapp-agente --probar-impresora "EPSON TM-T20"  prueba en una impresora del ordenador
+tpvlucrapp-agente --enlazar K7PQ-4XMW                enlazar sin preguntar (instalación desatendida)
+tpvlucrapp-agente --instalar                         dejarlo en segundo plano sin preguntar
+tpvlucrapp-agente --desinstalar                      quitarlo de este ordenador
+```
 
 ## Para desarrolladores
 
-El programa es `tpvlucrapp-agente.mjs` (Node.js 18 o más moderno también lo ejecuta: `node tpvlucrapp-agente.mjs`).
-Los ejecutables se generan con [Bun](https://bun.sh): `bun build ./tpvlucrapp-agente.mjs --compile --target=bun-windows-x64 --outfile tpvlucrapp-agente-windows.exe`
-(y `bun-darwin-arm64`, `bun-darwin-x64`).
+El programa es `tpvlucrapp-agente.mjs` (Node.js 18+ también lo ejecuta, pero entonces no arranca solo). Los ejecutables
+los hace GitHub Actions (`.github/workflows/programa.yml`) con [Bun](https://bun.sh); en Windows se prueba de verdad
+con una impresora que escribe a un archivo. Al etiquetar `vX.Y.Z` se publican en Releases.
+Para probar contra otro backend: `TPV_API=http://localhost:3001` (y `TPV_AGENTE_DATOS=/carpeta` para no tocar la del sistema).
