@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // =====================================================================================
-// TPV Lucrapp · Agente de impresión (versión 0.3.0)
+// TPV Lucrapp · Agente de impresión (versión 0.4.0)
 //
 // Se instala UNA vez en un ordenador del local y se queda funcionando en segundo plano, sin ventanas: arranca solo cada
 // vez que se enciende el ordenador. Imprime lo que la caja deja en la cola (comandas, tickets, informes de cierre,
@@ -8,6 +8,8 @@
 //   · en las impresoras instaladas en el ordenador (USB, red… las que ve Windows o Mac), por su propia cola de impresión;
 //   · o en impresoras de red por IP (ESC/POS, puerto 9100).
 // Y le cuenta a la oficina qué impresoras tiene el ordenador, para darlas de alta con un toque.
+// Desde la 0.4.0 también lleva los cobros al cajón automático (CashKeeper): se los pasa a CKMonitor por CKFast y le
+// cuenta a la caja cómo van (cobrado, cancelado o el motivo si falla).
 //
 // Instalar: en la oficina → Impresión y pantallas → «Conectar un ordenador»: descarga el programa, ábrelo y escribe el
 // código que sale en la oficina. En Windows pide permiso de administrador una vez (para arrancar solo con el ordenador).
@@ -16,6 +18,7 @@
 //   tpvlucrapp-agente --impresoras                      las impresoras que ve este ordenador
 //   tpvlucrapp-agente --probar 192.168.1.50:9100        prueba en una impresora de red
 //   tpvlucrapp-agente --probar-impresora "EPSON TM-T20" prueba en una impresora del ordenador
+//   tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501   comprueba que CKMonitor contesta (CKFast)
 //   tpvlucrapp-agente --desinstalar                     quitarlo de este ordenador
 //   (--servicio: lo usa el arranque automático · --enlazar CÓDIGO y --instalar: instalación sin preguntas)
 // Con Node.js 18+ también vale (node tpvlucrapp-agente.mjs), pero entonces no arranca solo: se queda en la ventana.
@@ -28,7 +31,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -435,6 +438,151 @@ async function desinstalar() {
   fs.rmSync(DATOS, { recursive: true, force: true });
 }
 
+// Cajón automático (CashKeeper) ---------------------------------------------------------------------------------------
+// CKFast (manual del integrador de CashKeeper, §3): un socket a CKMonitor (puerto 16501 de serie), texto ASCII sin fin de
+// línea y una respuesta corta; una conexión por orden (las largas se cortan). «C|tiquet|importe|…» crea el cobro (con el
+// importe en negativo, una devolución) y «S|tiquet» dice cómo va: OK|Pending, OK|OK (cobrado), OK|Cancel o NOK|Not found.
+// La pantalla del cobro (meter el dinero, la vuelta) es la de CKMonitor. La orden «C» ya viene hecha de la plataforma.
+
+/** Manda una orden a CKMonitor y devuelve su respuesta («OK|…» o «NOK|…»), sin espacios ni saltos. */
+function ordenCkfast(host, puerto, orden, espera = 8000) {
+  return new Promise((resolver, rechazar) => {
+    const conexion = net.createConnection({ host, port: Number(puerto) || 16501 });
+    let respuesta = "";
+    let terminado = false;
+    const acabar = (error) => {
+      if (terminado) return;
+      terminado = true;
+      clearTimeout(tiempo);
+      conexion.destroy();
+      if (error) rechazar(error);
+      else resolver(respuesta.replace(/[\0\r\n]+/g, "").trim());
+    };
+    const tiempo = setTimeout(() => acabar(respuesta ? null : new Error(`CKMonitor no contesta en ${host}:${puerto}`)), espera);
+    conexion.setEncoding("utf8");
+    conexion.on("connect", () => conexion.write(Buffer.from(orden, "ascii")));
+    conexion.on("data", (trozo) => {
+      respuesta += trozo;
+      // La respuesta es corta y llega de una vez: se da un respiro por si llega en dos trozos.
+      if (/^N?OK\|/.test(respuesta.trim())) setTimeout(() => acabar(null), 60);
+    });
+    // Cerrar sin contestar no es una respuesta: es un corte (se reintenta o se sigue esperando).
+    conexion.on("end", () => acabar(respuesta.trim() ? null : new Error("CKMonitor cerró la conexión sin contestar")));
+    conexion.on("error", (error) => acabar(error));
+  });
+}
+
+/** Lo que significa cada «no» de CKMonitor, para la caja. */
+function explicarCkfast(respuesta) {
+  const textos = {
+    "NOK|Invalid ID": "CKMonitor no acepta el número del cobro",
+    "NOK|Failed": "CKMonitor no ha podido añadir el cobro a su cola",
+    "NOK|Unknown command": "CKMonitor no entiende la orden: ¿está activado CKFast en su configuración?",
+    "NOK|Not found": "CKMonitor ya no tiene este cobro (¿se reinició?): revisa en su registro si se cobró",
+  };
+  return textos[respuesta] ?? `CKMonitor ha contestado «${respuesta || "nada"}»`;
+}
+
+const euros = (centimos) => `${(centimos / 100).toFixed(2).replace(".", ",")} €`;
+/** Las operaciones del cajón que se están llevando (cada una en paralelo: no frenan la impresión). */
+const cajonEnMarcha = new Set();
+
+/**
+ * Lleva una operación del cajón de principio a fin: crea el tiquet (si ya existía, es que se retoma), pregunta cada
+ * segundo cómo va, avisa a la plataforma cada 15 s mientras espera y cuenta cómo acabó. Si CKMonitor deja de contestar
+ * un momento, sigue esperando: el cliente puede estar metiendo el dinero. Nunca lanza.
+ */
+async function vigilarCajon(configuracion, op) {
+  const avisar = (estado, error) =>
+    llamarApi(configuracion, "POST", `/cajon/${op.id}/estado`, { estado, ...(error ? { error: String(error).slice(0, 300) } : {}) }).catch((fallo) =>
+      log(`No se pudo contar a la plataforma cómo va el cobro del cajón (${estado}): ${fallo.message}`),
+    );
+  const donde = `${op.host}:${op.puerto}`;
+  try {
+    if (op.tipo === "prueba") {
+      const respuesta = await ordenCkfast(op.host, op.puerto, `S|${op.ticket}`);
+      if (/^N?OK\|/.test(respuesta)) {
+        log(`✓ CashKeeper: CKMonitor contesta en ${donde} («${respuesta}»)`);
+        await avisar("cobrada");
+      } else {
+        await avisar("error", explicarCkfast(respuesta));
+      }
+      return;
+    }
+    const que = op.tipo === "devolucion" ? "devolución" : "cobro";
+    // 1. Crear el tiquet en CKMonitor (tres intentos si no contesta).
+    for (let intento = 1; ; intento++) {
+      try {
+        const respuesta = await ordenCkfast(op.host, op.puerto, op.orden);
+        if (respuesta === "OK|Added" || respuesta === "NOK|Already exists") break;
+        log(`✗ CashKeeper: ${que} de ${euros(op.importe_centimos)}: ${respuesta}`);
+        await avisar("error", explicarCkfast(respuesta));
+        return;
+      } catch (error) {
+        if (intento >= 3) {
+          log(`✗ CashKeeper: no se puede hablar con CKMonitor en ${donde}: ${error.message}`);
+          await avisar("error", `No se puede hablar con CKMonitor en ${donde}: ¿está abierto en ese ordenador?`);
+          return;
+        }
+        await dormir(2000);
+      }
+    }
+    await avisar("en_curso");
+    log(`… CashKeeper: ${que} de ${euros(op.importe_centimos)} en CKMonitor${op.reanudar ? " (se retoma)" : ""}`);
+    // 2. Preguntar cada segundo hasta que acabe (como mucho 20 minutos).
+    const limite = Date.now() + 20 * 60_000;
+    let ultimoAviso = Date.now();
+    let fallosSeguidos = 0;
+    let rarasSeguidas = 0;
+    while (Date.now() < limite) {
+      await dormir(1000);
+      let respuesta;
+      try {
+        respuesta = await ordenCkfast(op.host, op.puerto, `S|${op.ticket}`);
+        fallosSeguidos = 0;
+      } catch (error) {
+        fallosSeguidos++;
+        if (fallosSeguidos === 1 || fallosSeguidos % 60 === 0) log(`CashKeeper: CKMonitor no contesta (${error.message}); se sigue esperando`);
+        continue;
+      }
+      if (respuesta === "OK|OK") {
+        log(`✓ CashKeeper: ${que} de ${euros(op.importe_centimos)} hecho`);
+        await avisar("cobrada");
+        return;
+      }
+      if (respuesta === "OK|Cancel") {
+        log(`✗ CashKeeper: ${que} de ${euros(op.importe_centimos)} cancelado en CKMonitor`);
+        await avisar("cancelada");
+        return;
+      }
+      if (respuesta === "NOK|Not found") {
+        log(`✗ CashKeeper: ${que} de ${euros(op.importe_centimos)}: ${respuesta}`);
+        await avisar("error", explicarCkfast(respuesta));
+        return;
+      }
+      // Una respuesta que no se espera se tolera un rato (puede ser un tropiezo); si sigue, se cuenta.
+      if (respuesta !== "OK|Pending") {
+        rarasSeguidas++;
+        if (rarasSeguidas >= 30) {
+          log(`✗ CashKeeper: ${que} de ${euros(op.importe_centimos)}: ${respuesta}`);
+          await avisar("error", explicarCkfast(respuesta));
+          return;
+        }
+        continue;
+      }
+      rarasSeguidas = 0;
+      // Señal de vida: si no, la plataforma cree que este programa se paró y se lo daría otra vez.
+      if (Date.now() - ultimoAviso > 15_000) {
+        ultimoAviso = Date.now();
+        await avisar("en_curso");
+      }
+    }
+    await avisar("error", "El CashKeeper no ha terminado en 20 minutos: revisa en CKMonitor si se cobró");
+  } catch (error) {
+    await avisar("error", String(error.message ?? error));
+  }
+}
+
 // Hablar con la plataforma ------------------------------------------------------------------------------------------
 
 async function llamarApi(configuracion, metodo, ruta, cuerpo) {
@@ -504,8 +652,14 @@ async function trabajar() {
         const lista = latido.impresoras.map((i) => i.nombre).join(", ");
         log(`Conectado como «${latido.agente.nombre}» · ${impresoras?.length ?? 0} impresoras en el ordenador · asignadas: ${lista || "ninguna todavía"}`);
       }
-      const { trabajos } = await llamarApi(configuracion, "GET", "/trabajos?espera=25");
+      const { trabajos, cajon = [] } = await llamarApi(configuracion, "GET", "/trabajos?espera=25");
       fallos = 0;
+      // Los cobros del cajón, cada uno por su lado (pueden tardar minutos): la impresión sigue mientras.
+      for (const operacion of cajon) {
+        if (cajonEnMarcha.has(operacion.id)) continue;
+        cajonEnMarcha.add(operacion.id);
+        vigilarCajon(configuracion, operacion).finally(() => cajonEnMarcha.delete(operacion.id));
+      }
       for (const trabajo of trabajos) await procesarTrabajo(configuracion, trabajo);
     } catch (error) {
       if (error.estado === 401) {
@@ -614,6 +768,16 @@ if (orden === "--servicio") {
     await salir(0, `✓ Enviado a «${valor}».`);
   } catch (error) {
     await salir(1, `✗ ${error.message}`);
+  }
+} else if (orden === "--probar-cashkeeper") {
+  const [host, puerto = "16501"] = String(valor ?? "").split(":");
+  if (!host) await salir(1, "Uso: tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501 (la IP del ordenador con CKMonitor y su puerto CKFast)");
+  try {
+    // Un tiquet que no existe: si CKMonitor está y tiene CKFast activado, contesta «NOK|Not found».
+    const respuesta = await ordenCkfast(host, puerto, "S|1");
+    await salir(/^N?OK\|/.test(respuesta) ? 0 : 1, `${/^N?OK\|/.test(respuesta) ? "✓" : "✗"} CKMonitor en ${host}:${puerto} contesta «${respuesta || "nada"}».`);
+  } catch (error) {
+    await salir(1, `✗ ${error.message}. ¿Está CKMonitor abierto en ese ordenador y con CKFast activado (Configuración → Tipo de conector)?`);
   }
 } else if (orden === "--enlazar") {
   try {

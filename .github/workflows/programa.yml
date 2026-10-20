@@ -1,6 +1,7 @@
 # El programa del ordenador del local: se compila y se prueba en Windows de verdad (impresora de prueba que escribe a un
-# archivo: se comprueba que los bytes llegan tal cual, la tarea de arranque y quitarlo), se compila para Mac y, al
-# etiquetar una versión (v0.3.0…), se publica en Releases (los enlaces de la oficina apuntan a la última).
+# archivo: se comprueba que los bytes llegan tal cual, la tarea de arranque y quitarlo; y el cobro en el CashKeeper con
+# una plataforma y un CKMonitor de mentira), se compila para Mac (con la misma prueba del CashKeeper) y, al etiquetar una
+# versión (v0.3.0…), se publica en Releases (los enlaces de la oficina apuntan a la última).
 name: Programa del ordenador
 
 on:
@@ -23,6 +24,8 @@ jobs:
           bun-version: latest
       - name: Compilar
         run: bun build ./tpvlucrapp-agente.mjs --compile --target=bun-windows-x64 --outfile tpvlucrapp-agente-windows.exe
+      - name: Cobra en el CashKeeper (plataforma y CKMonitor de mentira)
+        run: node pruebas/cajon.mjs .\tpvlucrapp-agente-windows.exe
       - name: Impresora de prueba (lo que recibe va a un archivo)
         shell: pwsh
         run: |
@@ -84,6 +87,7 @@ jobs:
           bun build ./tpvlucrapp-agente.mjs --compile --target=bun-darwin-x64 --outfile intel/tpvlucrapp-agente
           ./apple/tpvlucrapp-agente --version
           ./apple/tpvlucrapp-agente --impresoras
+          node pruebas/cajon.mjs ./apple/tpvlucrapp-agente
           (cd apple && zip -q ../tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente)
           (cd intel && zip -q ../tpvlucrapp-agente-mac-intel.zip tpvlucrapp-agente)
       - uses: actions/upload-artifact@v4
@@ -106,5 +110,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Programa del ordenador ${GITHUB_REF_NAME#v}" \
-            --notes "Se instala una vez y arranca solo con el ordenador; imprime en las impresoras instaladas en Windows o Mac y en las de red por IP." \
+            --notes "Se instala una vez y arranca solo con el ordenador; imprime en las impresoras instaladas en Windows o Mac y en las de red por IP; desde la 0.4.0, cobra el efectivo en el CashKeeper (CKMonitor con CKFast)." \
             tpvlucrapp-agente-windows.exe tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente-mac-intel.zip

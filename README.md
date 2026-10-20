@@ -23,6 +23,19 @@ Y le cuenta a la oficina qué impresoras tiene el ordenador, para darlas de alta
 - Windows avisa «Windows protegió tu PC» la primera vez: **Más información → Ejecutar de todas formas** (el programa aún no va firmado).
 - Mac avisa de que no puede comprobarlo: clic derecho → **Abrir**, o Ajustes del Sistema → **Privacidad y seguridad** → «Abrir de todos modos».
 
+## Cajón automático (CashKeeper)
+
+Desde la 0.4.0, si el local tiene un **CashKeeper**, el programa del ordenador donde está **CKMonitor** le pasa los
+cobros en efectivo de la caja: la máquina recoge el dinero y da la vuelta, y la caja lo apunta cuando la máquina lo
+confirma.
+
+1. En CKMonitor, activa la conexión **CKFast** (puerto 16501 de serie).
+2. En la oficina → **Impresión y pantallas** → **Cajones automáticos** → **Añadir CashKeeper**: elige este ordenador y
+   deja `127.0.0.1` y el puerto 16501 si CKMonitor está en él. Pulsa **Probar**: debe decir «CKMonitor contesta».
+3. En **Cajón de cada caja**, elige el cajón para la caja que cobra con él.
+
+Para comprobarlo desde el propio ordenador: `tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501`.
+
 ## Dónde queda
 
 | | Windows | Mac |
@@ -38,6 +51,7 @@ tpvlucrapp-agente                                    instalar o ver el estado (c
 tpvlucrapp-agente --impresoras                       las impresoras que ve este ordenador
 tpvlucrapp-agente --probar 192.168.1.50:9100         prueba en una impresora de red
 tpvlucrapp-agente --probar-impresora "EPSON TM-T20"  prueba en una impresora del ordenador
+tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501   comprueba que CKMonitor contesta (cajón automático CashKeeper)
 tpvlucrapp-agente --enlazar K7PQ-4XMW                enlazar sin preguntar (instalación desatendida)
 tpvlucrapp-agente --instalar                         dejarlo en segundo plano sin preguntar
 tpvlucrapp-agente --desinstalar                      quitarlo de este ordenador
