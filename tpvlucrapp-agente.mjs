@@ -19,6 +19,7 @@
 //   tpvlucrapp-agente --probar 192.168.1.50:9100        prueba en una impresora de red
 //   tpvlucrapp-agente --probar-impresora "EPSON TM-T20" prueba en una impresora del ordenador
 //   tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501   comprueba que CKMonitor contesta (CKFast)
+//   tpvlucrapp-agente --leer-cashkeeper 192.168.1.20 [CLAVE]  lee el efectivo de la máquina (conexión de consulta)
 //   tpvlucrapp-agente --desinstalar                     quitarlo de este ordenador
 //   (--servicio: lo usa el arranque automático · --enlazar CÓDIGO y --instalar: instalación sin preguntas)
 // Con Node.js 18+ también vale (node tpvlucrapp-agente.mjs), pero entonces no arranca solo: se queda en la ventana.
@@ -31,7 +32,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -484,6 +485,108 @@ function explicarCkfast(respuesta) {
 }
 
 const euros = (centimos) => `${(centimos / 100).toFixed(2).replace(".", ",")} €`;
+
+// Leer el efectivo (desde la 0.5.0) -------------------------------------------------------------------------------------
+// Por la conexión de solo consulta del CashKeeper («Office», puerto 8002; manual del integrador §8): entrar con la clave
+// (StartCNT `$47#` → `$57|número#` → `$57|número+clave#` → `$58|versión#`), pedir las unidades de cada moneda y billete
+// para dar cambio (79 GetLastLevels; si no la entiende, 19 GetCurrentLevel con las del euro) y las del cajón de
+// recaudación (17 GetCashBoxLevel) y cerrar. NUNCA Startup, Terminate ni nada que mueva o cierre la máquina: la tiene
+// CKMonitor. Los valores van en céntimos (un billete de 5 € es 500) y solo cuentan los euros (la máquina puede aceptar
+// otras divisas).
+
+const VALORES_EURO = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+
+/** Cada valor con sus unidades, de dos listas separadas por comas (y, si viene, la divisa de cada uno). */
+function unidadesDe(valores = "", cantidades = "", divisas = "") {
+  const v = String(valores).split(",").map((x) => Number(x.trim()));
+  const c = String(cantidades).split(",").map((x) => Number(x.trim()));
+  const d = String(divisas).split(",").map((x) => x.trim().toUpperCase());
+  const lista = [];
+  v.forEach((valor, i) => {
+    if (!Number.isInteger(valor) || valor <= 0) return;
+    if (d.length === v.length && d[i] && d[i] !== "EUR") return;
+    lista.push({ valor, unidades: Number.isInteger(c[i]) && c[i] >= 0 ? c[i] : 0 });
+  });
+  return lista;
+}
+
+const totalDe = (lista) => lista.reduce((suma, { valor, unidades }) => suma + valor * unidades, 0);
+
+/** Lee lo que hay en la máquina: { divisa, cambio: [{valor, unidades}], recaudacion: [{valor, unidades}] }. */
+function leerEfectivo(host, puerto, semilla, espera = 15000) {
+  return new Promise((resolver, rechazar) => {
+    const conexion = net.createConnection({ host, port: Number(puerto) || 8002 });
+    const resultado = { divisa: "EUR", cambio: [], recaudacion: [] };
+    let pendiente = "";
+    let claveMandada = false;
+    let dentro = false;
+    let acabado = false;
+    const acabar = (error) => {
+      if (acabado) return;
+      acabado = true;
+      clearTimeout(tiempo);
+      conexion.destroy();
+      if (error) rechazar(error);
+      else resolver(resultado);
+    };
+    const tiempo = setTimeout(
+      () => acabar(new Error(dentro ? `La máquina no contesta a la consulta en ${host}:${puerto}` : `No se puede entrar en la consulta de la máquina en ${host}:${puerto}`)),
+      espera,
+    );
+    const mandar = (orden) => conexion.write(Buffer.from(orden, "ascii"));
+    const atender = (codigo, p) => {
+      if (codigo === "57" && !claveMandada) {
+        claveMandada = true;
+        const clave = Number(p[0]) + Number(semilla);
+        if (!Number.isSafeInteger(clave)) throw new Error("La máquina no ha dado el número para la clave de consulta");
+        return mandar(`$57|${clave}#`);
+      }
+      if (codigo === "58") {
+        dentro = true;
+        return mandar("$79|0#");
+      }
+      if (codigo === "79") {
+        if (p[0] !== "1") return mandar(`$19|${VALORES_EURO.join(",")}#`);
+        resultado.cambio = unidadesDe(p[1], p[2], p[3]);
+        return mandar("$17#");
+      }
+      if (codigo === "19") {
+        if (p[0] !== "1") throw new Error(`La máquina no deja leer lo que hay para dar cambio (${p.slice(1).join(" ")})`);
+        resultado.cambio = unidadesDe(VALORES_EURO.join(","), p[1]);
+        return mandar("$17#");
+      }
+      if (codigo === "17") {
+        if (p[0] !== "1") throw new Error(`La máquina no deja leer el cajón de recaudación (${p.slice(1).join(" ")})`);
+        if (p[1] && p[1].toUpperCase() !== "EUR") resultado.recaudacion = [];
+        else resultado.recaudacion = unidadesDe(p[2], p[3]);
+        return acabar(null);
+      }
+      // Lo demás (eventos como «$106|2#», cambios de estado): no se pide, no se usa.
+    };
+    conexion.setEncoding("latin1");
+    conexion.on("connect", () => mandar("$47#"));
+    conexion.on("data", (trozo) => {
+      pendiente += trozo;
+      for (let fin = pendiente.indexOf("#"); fin >= 0; fin = pendiente.indexOf("#")) {
+        const mensaje = pendiente.slice(0, fin);
+        pendiente = pendiente.slice(fin + 1);
+        const inicio = mensaje.indexOf("$");
+        if (inicio < 0) continue;
+        const partes = mensaje.slice(inicio + 1).split("|").map((x) => x.trim());
+        try {
+          atender(partes[0], partes.slice(1));
+        } catch (error) {
+          return acabar(error);
+        }
+      }
+    });
+    // Con la clave mala, la máquina cierra la conexión sin decir nada.
+    conexion.on("end", () =>
+      acabar(new Error(dentro ? "La máquina cortó la consulta" : "La máquina no acepta la clave de consulta (de serie 100001): revísala en la oficina")),
+    );
+    conexion.on("error", (error) => acabar(error));
+  });
+}
 /** Las operaciones del cajón que se están llevando (cada una en paralelo: no frenan la impresión). */
 const cajonEnMarcha = new Set();
 
@@ -493,12 +596,26 @@ const cajonEnMarcha = new Set();
  * un momento, sigue esperando: el cliente puede estar metiendo el dinero. Nunca lanza.
  */
 async function vigilarCajon(configuracion, op) {
-  const avisar = (estado, error) =>
-    llamarApi(configuracion, "POST", `/cajon/${op.id}/estado`, { estado, ...(error ? { error: String(error).slice(0, 300) } : {}) }).catch((fallo) =>
-      log(`No se pudo contar a la plataforma cómo va el cobro del cajón (${estado}): ${fallo.message}`),
-    );
+  const avisar = (estado, error, resultado) =>
+    llamarApi(configuracion, "POST", `/cajon/${op.id}/estado`, {
+      estado,
+      ...(error ? { error: String(error).slice(0, 300) } : {}),
+      ...(resultado ? { resultado } : {}),
+    }).catch((fallo) => log(`No se pudo contar a la plataforma cómo va el cajón (${estado}): ${fallo.message}`));
   const donde = `${op.host}:${op.puerto}`;
   try {
+    // Leer el efectivo (no pasa por CKMonitor: va a la propia máquina, solo consulta).
+    if (op.tipo === "consulta") {
+      try {
+        const leido = await leerEfectivo(op.host, op.puerto, op.semilla ?? "100001");
+        log(`✓ CashKeeper: efectivo leído en ${donde}: ${euros(totalDe(leido.cambio))} para cambio y ${euros(totalDe(leido.recaudacion))} en recaudación`);
+        await avisar("cobrada", null, leido);
+      } catch (error) {
+        log(`✗ CashKeeper: no se pudo leer el efectivo en ${donde}: ${error.message}`);
+        await avisar("error", error.message);
+      }
+      return;
+    }
     if (op.tipo === "prueba") {
       const respuesta = await ordenCkfast(op.host, op.puerto, `S|${op.ticket}`);
       if (/^N?OK\|/.test(respuesta)) {
@@ -778,6 +895,28 @@ if (orden === "--servicio") {
     await salir(/^N?OK\|/.test(respuesta) ? 0 : 1, `${/^N?OK\|/.test(respuesta) ? "✓" : "✗"} CKMonitor en ${host}:${puerto} contesta «${respuesta || "nada"}».`);
   } catch (error) {
     await salir(1, `✗ ${error.message}. ¿Está CKMonitor abierto en ese ordenador y con CKFast activado (Configuración → Tipo de conector)?`);
+  }
+} else if (orden === "--leer-cashkeeper") {
+  const [host, puerto = "8002"] = String(valor ?? "").split(":");
+  const clave = process.argv[4] ?? "100001";
+  if (!host) await salir(1, "Uso: tpvlucrapp-agente --leer-cashkeeper 192.168.1.20 [CLAVE] (la IP de la máquina CashKeeper y su clave de consulta; de serie 100001)");
+  try {
+    const leido = await leerEfectivo(host, puerto, clave);
+    const filas = (lista) => lista.filter((x) => x.unidades > 0).map((x) => `  ${euros(x.valor).padStart(9)} × ${String(x.unidades).padStart(4)} = ${euros(x.valor * x.unidades)}`);
+    await salir(
+      0,
+      [
+        `✓ Efectivo en la máquina ${host}:${puerto}`,
+        "Para dar cambio:",
+        ...filas(leido.cambio),
+        `  Total: ${euros(totalDe(leido.cambio))}`,
+        "En el cajón de recaudación:",
+        ...filas(leido.recaudacion),
+        `  Total: ${euros(totalDe(leido.recaudacion))}`,
+      ].join("\n"),
+    );
+  } catch (error) {
+    await salir(1, `✗ ${error.message}`);
   }
 } else if (orden === "--enlazar") {
   try {

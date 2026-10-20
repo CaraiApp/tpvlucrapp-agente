@@ -36,6 +36,12 @@ confirma.
 
 Para comprobarlo desde el propio ordenador: `tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501`.
 
+**Leer el efectivo** (desde la 0.5.0): para ver al abrir y al cerrar la caja cuántas monedas y billetes de cada valor hay,
+el programa entra en la propia máquina por su conexión de solo consulta (puerto 8002, con su clave; de fábrica 100001).
+No mueve dinero ni toca lo que hace CKMonitor. En el cajón (oficina → Editar) pon la **IP de la máquina** (la que sale en
+su pantalla) y, si el instalador la cambió, la clave. Para comprobarlo: `tpvlucrapp-agente --leer-cashkeeper
+192.168.1.20 [CLAVE]`.
+
 ## Dónde queda
 
 | | Windows | Mac |
@@ -52,6 +58,7 @@ tpvlucrapp-agente --impresoras                       las impresoras que ve este 
 tpvlucrapp-agente --probar 192.168.1.50:9100         prueba en una impresora de red
 tpvlucrapp-agente --probar-impresora "EPSON TM-T20"  prueba en una impresora del ordenador
 tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501   comprueba que CKMonitor contesta (cajón automático CashKeeper)
+tpvlucrapp-agente --leer-cashkeeper 192.168.1.20 [CLAVE] lee el efectivo de la máquina (conexión de consulta)
 tpvlucrapp-agente --enlazar K7PQ-4XMW                enlazar sin preguntar (instalación desatendida)
 tpvlucrapp-agente --instalar                         dejarlo en segundo plano sin preguntar
 tpvlucrapp-agente --desinstalar                      quitarlo de este ordenador
