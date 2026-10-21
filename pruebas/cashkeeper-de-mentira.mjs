@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const DENOMINACIONES = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
 /** Lo que tiene al empezar para dar cambio (unidades de cada valor) y en el cajón de recaudación. */
 const CAMBIO_DE_SERIE = { 5: 20, 10: 20, 20: 20, 50: 20, 100: 20, 200: 20, 500: 10, 1000: 10, 2000: 5, 5000: 0 };
-const RECAUDACION_DE_SERIE = { 2000: 1, 5000: 2 };
+const RECAUDACION_DE_SERIE = { 100: 5, 200: 3, 2000: 1, 5000: 2 };
 const total = (unidades) => Object.entries(unidades).reduce((suma, [valor, n]) => suma + Number(valor) * n, 0);
 
 export function crearCashKeeper(opciones = {}) {

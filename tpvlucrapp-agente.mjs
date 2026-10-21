@@ -11,7 +11,8 @@
 // Desde la 0.4.0 también lleva los cobros al cajón automático (CashKeeper): se los pasa a CKMonitor por CKFast y le
 // cuenta a la caja cómo van (cobrado, cancelado o el motivo si falla). Desde la 0.6.0, también sin CKMonitor: habla
 // directamente con la máquina (conexión de control) y la caja enseña en vivo lo que se mete y la vuelta. Desde la 0.6.1,
-// sin CKMonitor, también vacía el cajón de recaudación y cambia efectivo (la caja elige con qué billetes y monedas).
+// sin CKMonitor, también vacía el cajón de recaudación y cambia efectivo (la caja elige con qué billetes y monedas). Desde
+// la 0.6.2, vacía el cajón de recaudación de monedas, el de billetes o los dos (el que elija la caja).
 //
 // Instalar: en la oficina → Impresión y pantallas → «Conectar un ordenador»: descarga el programa, ábrelo y escribe el
 // código que sale en la oficina. En Windows pide permiso de administrador una vez (para arrancar solo con el ordenador).
@@ -36,7 +37,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.6.1";
+const VERSION = "0.6.2";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -911,7 +912,7 @@ async function operarEnMaquina(m, op, avisar) {
     await avisar("cobrada", null, { estado: ESTADO_CK[m.estado] ?? String(m.estado) });
     return;
   }
-  if (op.tipo === "vaciado") return vaciarRecaudacion(m, avisar);
+  if (op.tipo === "vaciado") return vaciarRecaudacion(m, avisar, op.vaciar);
   if (op.tipo === "cambio") return cambiarEfectivo(m, avisar);
   const saca = op.tipo === "devolucion" || op.tipo === "salida";
   const objetivo = op.importe_centimos + (op.propina_centimos ?? 0);
@@ -1153,10 +1154,15 @@ async function nivelesDeRecaudacion(m) {
 /**
  * Vaciar el cajón de recaudación (desde la 0.6.1; Luis, 21-10): la máquina dice lo que tiene (17 GetCashBoxLevel) y la
  * caja lo enseña; se saca el dinero y, con «Ya lo he vaciado», se mira otra vez y se pone el contador a cero
- * (11 EmptyCashBox, monedas y billetes). Lo que había justo antes es lo que se apunta como salida de caja. Con «Cancelar»
- * (o si nadie lo confirma en 15 minutos) no se toca nada.
+ * (11 EmptyCashBox). Desde la 0.6.2, solo el cajón elegido (Luis: «deberíamos poder elegir entre uno u otro… siempre de
+ * los de recaudación»): `monedas` (11|1), `billetes` (11|2) o `todo` (11|5); lo que se lee, se enseña y se apunta es solo
+ * lo de ese cajón. Lo que había justo antes es lo que se apunta como salida de caja. Con «Cancelar» (o si nadie lo
+ * confirma en 15 minutos) no se toca nada.
  */
-async function vaciarRecaudacion(m, avisar) {
+const VACIAR = { monedas: { codigo: 1, nombre: "de monedas" }, billetes: { codigo: 2, nombre: "de billetes" }, todo: { codigo: 5, nombre: "" } };
+async function vaciarRecaudacion(m, avisar, cual = "todo") {
+  const vaciar = VACIAR[cual] ?? VACIAR.todo;
+  const delCajon = (lista) => lista.filter((x) => cual === "billetes" ? x.valor >= 500 : cual === "monedas" ? x.valor < 500 : true);
   const progreso = { fase: "conectando", objetivo: 0, introducido: 0, devuelto: 0 };
   const pedido = { cancelar: false, terminar: false };
   const contar = async (lectura) => {
@@ -1164,19 +1170,20 @@ async function vaciarRecaudacion(m, avisar) {
     if (r?.cancelar) pedido.cancelar = true;
     if (r?.terminar) pedido.terminar = true;
   };
-  const leer = async () => ({ divisa: "EUR", cambio: await nivelesDeCambio(m).catch(() => []), recaudacion: await nivelesDeRecaudacion(m) });
+  const leer = async () => ({ divisa: "EUR", cambio: await nivelesDeCambio(m).catch(() => []), recaudacion: delCajon(await nivelesDeRecaudacion(m)) });
   await contar();
   await esperarVuelta(m, 60_000);
   await devolverLoCortado(m);
   let lectura = await leer();
   progreso.objetivo = totalDe(lectura.recaudacion);
+  const cajon = `el cajón de recaudación${vaciar.nombre ? ` ${vaciar.nombre}` : ""}`;
   if (progreso.objetivo === 0) {
-    log("CashKeeper (directo): el cajón de recaudación está vacío");
-    await avisar("cancelada", "El cajón de recaudación está vacío: no hay nada que sacar", lectura, { ...progreso, fase: "cancelado" });
+    log(`CashKeeper (directo): ${cajon} está vacío`);
+    await avisar("cancelada", `${cajon[0].toUpperCase()}${cajon.slice(1)} está vacío: no hay nada que sacar`, lectura, { ...progreso, fase: "cancelado" });
     return;
   }
   progreso.fase = "vaciando";
-  log(`CashKeeper (directo): en el cajón de recaudación hay ${euros(progreso.objetivo)}; se espera a que lo vacíen`);
+  log(`CashKeeper (directo): en ${cajon} hay ${euros(progreso.objetivo)}; se espera a que lo vacíen`);
   await contar(lectura);
   const limite = Date.now() + 15 * 60_000;
   while (!pedido.cancelar && !pedido.terminar && Date.now() < limite) {
@@ -1188,13 +1195,13 @@ async function vaciarRecaudacion(m, avisar) {
     await avisar("cancelada", pedido.cancelar ? null : "Nadie confirmó el vaciado en 15 minutos: no se ha apuntado nada", null, { ...progreso, fase: "cancelado" });
     return;
   }
-  // «Ya lo he vaciado»: lo que había justo antes de ponerlo a cero es lo que se ha sacado.
+  // «Ya lo he vaciado»: lo que había justo antes de ponerlo a cero es lo que se ha sacado (solo ese cajón).
   lectura = await leer();
   const sacado = totalDe(lectura.recaudacion);
-  await m.orden(11, [5]); // EmptyCashBox: monedas y billetes
-  log(`✓ CashKeeper (directo): cajón de recaudación vaciado (${euros(sacado)})`);
+  await m.orden(11, [vaciar.codigo]); // EmptyCashBox: 1 monedas, 2 billetes, 5 los dos
+  log(`✓ CashKeeper (directo): ${cajon} vaciado (${euros(sacado)})`);
   if (sacado === 0) {
-    await avisar("cancelada", "El cajón de recaudación ya estaba a cero", lectura, { ...progreso, fase: "cancelado" });
+    await avisar("cancelada", `${cajon[0].toUpperCase()}${cajon.slice(1)} ya estaba a cero`, lectura, { ...progreso, fase: "cancelado" });
     return;
   }
   await avisar("cobrada", null, lectura, { ...progreso, objetivo: sacado, devuelto: sacado, fase: "hecho" });

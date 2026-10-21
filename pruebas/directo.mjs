@@ -4,7 +4,8 @@
 // Casos, en orden (la máquina hace una cosa cada vez): A cobra 7,50 € con 10 € (vuelta 2,50 €); B es «Probar»; C se
 // cancela desde la caja con 5 € dentro (la máquina los devuelve); D devuelve 3 €; E pide pagar más de lo que hay (error);
 // F mete 10 € de cambio; G se corta a media cobro, vuelve y se sigue con lo que la máquina tenía; H es una entrada sin
-// importe: se mete lo que sea (15 €) y se acepta desde la caja; I vacía el cajón de recaudación (120 €); J cambia un
+// importe: se mete lo que sea (15 €) y se acepta desde la caja; I vacía solo el cajón de recaudación de billetes
+// (120 €) e I2 solo el de monedas (11 €), cada uno con su orden y sin tocar el otro; J cambia un
 // billete de 50 € por 2 de 20 € y 2 de 5 €; K cambia 20 €: los billetes de 10 € se atascan y se eligen otra vez (4 de 5 €);
 // L mete 10 € para cambiar y se cancela al elegir (la máquina los devuelve).
 import { spawn } from "node:child_process";
@@ -56,7 +57,8 @@ const ops = [
   { ...directo, id: "op-F", tipo: "entrada", ticket: "6", orden: null, importe_centimos: 1000 },
   { ...directo, id: "op-G", tipo: "cobro", ticket: "7", orden: null, importe_centimos: 400 },
   { ...directo, id: "op-H", tipo: "entrada", ticket: "8", orden: null, importe_centimos: 0 },
-  { ...directo, id: "op-I", tipo: "vaciado", ticket: "9", orden: null, importe_centimos: 0 },
+  { ...directo, id: "op-I", tipo: "vaciado", ticket: "9", orden: null, importe_centimos: 0, vaciar: "billetes" },
+  { ...directo, id: "op-I2", tipo: "vaciado", ticket: "9b", orden: null, importe_centimos: 0, vaciar: "monedas" },
   { ...directo, id: "op-J", tipo: "cambio", ticket: "10", orden: null, importe_centimos: 0 },
   { ...directo, id: "op-K", tipo: "cambio", ticket: "11", orden: null, importe_centimos: 0 },
   { ...directo, id: "op-L", tipo: "cambio", ticket: "12", orden: null, importe_centimos: 0 },
@@ -106,7 +108,9 @@ const plataforma = http
         const cancelar = (id === "op-C" && metido > 0) || (id === "op-L" && fase === "eligiendo");
         // Acepta la entrada H cuando ya hay 15 € dentro, confirma el vaciado I y dice «Ya está» al cambiar.
         const terminar =
-          (id === "op-H" && metido >= 1500) || (id === "op-I" && fase === "vaciando") || (metidoParaCambiar[id] !== undefined && metido >= metidoParaCambiar[id]);
+          (id === "op-H" && metido >= 1500) ||
+          ((id === "op-I" || id === "op-I2") && fase === "vaciando") ||
+          (metidoParaCambiar[id] !== undefined && metido >= metidoParaCambiar[id]);
         const seleccion = fase === "eligiendo" ? eleccion(id) : null;
         return enviar({ estado: b.estado, cancelar, terminar, seleccion });
       }
@@ -159,11 +163,17 @@ const bien =
   ck.maquina.ordenes.includes("14") &&
   ck.maquina.ordenes.includes("42|1500|1") &&
   ck.maquina.startups >= 2 &&
-  // I: vació el cajón de recaudación (lo que había, 120 €) y lo puso a cero.
+  // I: vació solo el cajón de recaudación de billetes (120 €) y lo puso a cero (11|2); I2, solo el de monedas (11 €, 11|1).
   final("op-I")?.estado === "cobrada" &&
   p("op-I").devuelto === 12000 &&
-  ck.maquina.ordenes.includes("11|5") &&
+  ck.maquina.ordenes.includes("11|2") &&
   (r("op-I").recaudacion ?? []).some((n) => n.valor === 5000 && n.unidades === 2) &&
+  (r("op-I").recaudacion ?? []).every((n) => n.valor >= 500) &&
+  final("op-I2")?.estado === "cobrada" &&
+  p("op-I2").devuelto === 1100 &&
+  ck.maquina.ordenes.includes("11|1") &&
+  !ck.maquina.ordenes.includes("11|5") &&
+  (r("op-I2").recaudacion ?? []).every((n) => n.valor < 500) &&
   // J: 50 € → 2 de 20 € y 2 de 5 €, sin que lo metido cuente para otro cobro.
   final("op-J")?.estado === "cobrada" &&
   p("op-J").introducido === 5000 &&
