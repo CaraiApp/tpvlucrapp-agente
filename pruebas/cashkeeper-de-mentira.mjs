@@ -2,15 +2,21 @@
 // CKMonitor) y por la de consulta (Office). Para probar el programa sin máquina: en las pruebas automáticas
 // (pruebas/directo.mjs) y en local, metiendo «monedas» con el teclado.
 //   node pruebas/cashkeeper-de-mentira.mjs [--control 8001] [--consulta 8002] [--clave 100001]
-// En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; q sale.
+// En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; n enseña lo que tiene; q sale.
 // Sigue el manual del integrador (§7, §8 y anexo 9.2): clave con 47/57/58, 39 Startup, 40 State, 42 Totalize, 9 Disable,
-// 29 Pay, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation, y los avisos 100 Disabled,
-// 104 ProcessInterrupted, 106 StateChange, 107 ValueIN y 108 ValueOUT. Las cantidades van en céntimos.
+// 29 Pay, 30 PaySpecific, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation,
+// 11 EmptyCashBox, 17 GetCashBoxLevel, 79 GetLastLevels, y los avisos 100 Disabled, 104 ProcessInterrupted,
+// 106 StateChange, 107 ValueIN y 108 ValueOUT. Las cantidades van en céntimos. Lleva la cuenta de cada moneda y billete:
+// lo que hay para dar cambio (recicladores) y en el cajón de recaudación (los billetes de 50 € van ahí).
 import net from "node:net";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const DENOMINACIONES = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+/** Lo que tiene al empezar para dar cambio (unidades de cada valor) y en el cajón de recaudación. */
+const CAMBIO_DE_SERIE = { 5: 20, 10: 20, 20: 20, 50: 20, 100: 20, 200: 20, 500: 10, 1000: 10, 2000: 5, 5000: 0 };
+const RECAUDACION_DE_SERIE = { 2000: 1, 5000: 2 };
+const total = (unidades) => Object.entries(unidades).reduce((suma, [valor, n]) => suma + Number(valor) * n, 0);
 
 export function crearCashKeeper(opciones = {}) {
   const {
@@ -23,7 +29,11 @@ export function crearCashKeeper(opciones = {}) {
     ritmo = 200,
     // Simula un corte de la conexión de control al meter la moneda número `moneda` de un cobro de `objetivo` (una vez).
     cortar = null,
-    fondo = 30000,
+    // Lo que tiene para dar cambio y en el cajón de recaudación: { valor: unidades }.
+    cambio = CAMBIO_DE_SERIE,
+    recaudacion = RECAUDACION_DE_SERIE,
+    // Simula un atasco (una vez) al pagar con PaySpecific las unidades de este valor: no salen y acaba con error.
+    atasco = null,
     contar = () => {},
   } = opciones;
 
@@ -35,8 +45,12 @@ export function crearCashKeeper(opciones = {}) {
     recarga: false,
     interrumpida: null,
     cliente: null,
-    fondo,
-    recaudacion: 0,
+    cambio: Object.fromEntries(DENOMINACIONES.map((v) => [v, cambio[v] ?? 0])),
+    recaudacion: Object.fromEntries(DENOMINACIONES.map((v) => [v, recaudacion[v] ?? 0])),
+    // Lo metido en esta operación (para devolver lo mismo si se cancela) y el crédito que dejó un Disable sin devolver.
+    metidas: [],
+    credito: 0,
+    atascada: false,
     totalizes: 0,
     ordenes: [],
     prohibidas: [],
@@ -54,20 +68,65 @@ export function crearCashKeeper(opciones = {}) {
     avisar(`$106|${nuevo}|${antes}#`);
   };
 
-  /** Acaba lo que estaba haciendo: la vuelta (si hay) y el aviso 100 Disabled. */
-  function terminarCobro({ devolverTodo = false } = {}) {
+  /** Monedas y billetes para pagar `importe` con lo que hay para dar cambio (de mayor a menor), o null si no se puede. */
+  function piezasPara(importe) {
+    const piezas = [];
+    let falta = importe;
+    for (const valor of [...DENOMINACIONES].reverse()) {
+      let quedan = m.cambio[valor];
+      while (falta >= valor && quedan > 0) {
+        piezas.push(valor);
+        falta -= valor;
+        quedan--;
+      }
+    }
+    return falta === 0 ? piezas : null;
+  }
+
+  /** Saca esas piezas de la máquina, avisando de lo que sale (108 ValueOUT). */
+  function pagarPiezas(piezas, objetivo) {
+    let pagado = 0;
+    for (const valor of piezas) {
+      m.cambio[valor]--;
+      pagado += valor;
+      avisar(`$108|${pagado}|${objetivo}|0#`);
+    }
+    return pagado;
+  }
+
+  /** Lo metido se queda en la máquina: al cambio (o, los billetes de 50 € fuera del modo de llenado, a recaudación). */
+  function guardarMetidas() {
+    for (const valor of m.metidas) {
+      if (valor >= 5000 && !m.recarga) m.recaudacion[valor]++;
+      else m.cambio[valor]++;
+    }
+    m.metidas = [];
+  }
+
+  /** Acaba lo que estaba haciendo: la vuelta (si hay) y el aviso 100 Disabled. Sin `aceptar`, lo metido queda de crédito. */
+  function terminarCobro({ devolverTodo = false, quedarse = false } = {}) {
     clearInterval(temporizador);
     const metido = m.introducido;
-    const vuelta = devolverTodo ? metido : Math.max(0, metido - m.objetivo);
-    if (vuelta > 0) {
-      cambiarEstado(3);
-      avisar(`$108|${Math.round(vuelta / 2)}|${vuelta}|0#`);
-      avisar(`$108|${vuelta}|${vuelta}|0#`);
-    }
     const objetivo = m.objetivo;
-    if (!devolverTodo) {
-      if (m.recarga) m.fondo += metido - vuelta;
-      else m.recaudacion += metido - vuelta;
+    if (devolverTodo) {
+      // Devuelve lo mismo que se metió (y, si había crédito de antes, lo que falte, con lo que tenga).
+      cambiarEstado(3);
+      let pagado = 0;
+      for (const valor of m.metidas) {
+        pagado += valor;
+        avisar(`$108|${pagado}|${metido}|0#`);
+      }
+      m.metidas = [];
+      const resto = metido - pagado;
+      if (resto > 0) pagarPiezas(piezasPara(resto) ?? [], metido);
+    } else {
+      guardarMetidas();
+      if (quedarse) m.credito = metido;
+      const vuelta = quedarse ? 0 : Math.max(0, metido - objetivo);
+      if (vuelta > 0) {
+        cambiarEstado(3);
+        pagarPiezas(piezasPara(vuelta) ?? [], vuelta);
+      }
     }
     m.introducido = 0;
     m.objetivo = 0;
@@ -82,6 +141,7 @@ export function crearCashKeeper(opciones = {}) {
     monedasDeEsta++;
     cambiarEstado(7);
     m.introducido += valor;
+    m.metidas.push(valor);
     avisar(`$107|${m.introducido}|${m.objetivo}|0#`);
     if (cortar && cortar.objetivo === m.objetivo && cortar.moneda === monedasDeEsta && !cortar.hecho) {
       // Se corta la conexión con el programa: la máquina se cierra y guarda lo que estaba haciendo.
@@ -132,6 +192,11 @@ export function crearCashKeeper(opciones = {}) {
         if (![1, 2, 7].includes(m.estado)) return responder("$42|0|2|Dispositivo ocupado. No se puede procesar el comando#");
         m.totalizes++;
         monedasDeEsta = 0;
+        // El crédito que dejó un Disable sin devolver cuenta para este cobro si no se descartó (52 DiscardOperation).
+        if (m.estado === 1 && m.credito > 0) {
+          m.introducido += m.credito;
+          m.credito = 0;
+        }
         m.objetivo = Number(p[0]) || 0;
         m.autoclose = p[1] !== "0";
         responder("$42|1#");
@@ -159,26 +224,56 @@ export function crearCashKeeper(opciones = {}) {
       case "9": {
         if (m.estado !== 2 && m.estado !== 7) return responder("$9|0|36|El dispositivo no está habilitado. No se puede procesar el comando#");
         responder("$9|1#");
-        return terminarCobro({ devolverTodo: p[0] === "1" });
+        // Payback 1: devuelve lo metido; 0: se lo queda (como crédito de la operación, hasta un 52 DiscardOperation).
+        return p[0] === "1" ? terminarCobro({ devolverTodo: true }) : terminarCobro({ quedarse: true });
       }
       case "29": {
         const valor = Number(p[0]) || 0;
         if (m.estado !== 1) return responder("$29|0|2|Dispositivo ocupado. No se puede procesar el comando#");
-        if (valor > m.fondo) return responder("$29|0|32|No hay importe suficiente para realizar el pago#");
+        const piezas = piezasPara(valor);
+        if (!piezas) return responder("$29|0|32|No hay importe suficiente para realizar el pago#");
         responder("$29|1#");
         if (p[1] === "1") return;
         cambiarEstado(3);
-        avisar(`$108|${Math.round(valor / 2)}|${valor}|0#`);
-        avisar(`$108|${valor}|${valor}|0#`);
-        m.fondo -= valor;
+        pagarPiezas(piezas, valor);
         avisar(`$100|0||${valor}|${valor}|3|0#`);
         return cambiarEstado(1);
       }
+      case "30": {
+        // PaySpecific: valores y unidades separados por comas, y si es solo una prueba.
+        if (m.estado !== 1) return responder("$30|0|2|Dispositivo ocupado. No se puede procesar el comando#");
+        const valores = String(p[0] ?? "").split(",").map(Number);
+        const unidades = String(p[1] ?? "").split(",").map(Number);
+        if (valores.length !== unidades.length || valores.some((v, i) => !(m.cambio[v] >= unidades[i]) || !(unidades[i] > 0))) {
+          return responder("$30|0|32|No hay importe suficiente para realizar el pago#");
+        }
+        responder("$30|1#");
+        if (p[2] === "1") return;
+        const pedido = valores.reduce((suma, v, i) => suma + v * unidades[i], 0);
+        cambiarEstado(3);
+        const piezas = valores.flatMap((v, i) => Array(unidades[i]).fill(v));
+        const atascada = atasco !== null && !m.atascada && valores.includes(atasco);
+        if (atascada) m.atascada = true;
+        const pagado = pagarPiezas(atascada ? piezas.filter((v) => v !== atasco) : piezas, pedido);
+        avisar(atascada ? `$100|12|Atasco en la salida de billetes|${pagado}|${pedido}|3|0#` : `$100|0||${pagado}|${pedido}|3|0#`);
+        return cambiarEstado(1);
+      }
+      case "11": {
+        // EmptyCashBox: pone a cero el cajón de recaudación (1 monedas, 2 billetes, 5 todo).
+        if (m.estado !== 1) return responder("$11|0|2|Dispositivo ocupado. No se puede procesar el comando#");
+        const cual = Number(p[0]) || 5;
+        for (const v of DENOMINACIONES) if (cual === 5 || (cual === 1 && v < 500) || (cual === 2 && v >= 500)) m.recaudacion[v] = 0;
+        return responder("$11|1#");
+      }
+      case "17":
+      case "79":
+        return responder(niveles(codigo));
       case "67":
         m.recarga = true;
         return responder("$67|1#");
       case "52":
         m.introducido = 0;
+        m.credito = 0;
         return responder("$52|1#");
       case "68":
         return responder("$68|1#");
@@ -192,13 +287,17 @@ export function crearCashKeeper(opciones = {}) {
     }
   }
 
+  /** Lo que tiene: 79 GetLastLevels (para dar cambio) o 17 GetCashBoxLevel (cajón de recaudación). */
+  function niveles(codigo) {
+    if (codigo === "79") {
+      return `$79|1|${DENOMINACIONES.join(",")}|${DENOMINACIONES.map((v) => m.cambio[v]).join(",")}|${DENOMINACIONES.map(() => "EUR").join(",")}#`;
+    }
+    return `$17|1|EUR|${DENOMINACIONES.join(",")}|${DENOMINACIONES.map((v) => m.recaudacion[v]).join(",")}#`;
+  }
+
   function atenderConsulta(socket, codigo) {
     const responder = (texto) => mandar(socket, texto);
-    if (codigo === "79") {
-      const unidades = DENOMINACIONES.map((v) => (v >= 500 ? 2 : 10));
-      return responder(`$79|1|${DENOMINACIONES.join(",")}|${unidades.join(",")}|${DENOMINACIONES.map(() => "EUR").join(",")}#`);
-    }
-    if (codigo === "17") return responder(`$17|1|EUR|500,1000,2000,5000|${Math.floor(m.recaudacion / 500)},0,0,0#`);
+    if (codigo === "79" || codigo === "17") return responder(niveles(codigo));
     return responder(`$${codigo}|0|42|Orden no esperada#`);
   }
 
@@ -250,6 +349,8 @@ export function crearCashKeeper(opciones = {}) {
   return {
     maquina: m,
     meter,
+    totalCambio: () => total(m.cambio),
+    totalRecaudacion: () => total(m.recaudacion),
     cerrar() {
       clearInterval(temporizador);
       m.cliente?.destroy();
@@ -272,13 +373,22 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   });
   const teclas = { 1: 100, 2: 200, 5: 500, 0: 1000, v: 2000, c: 5000 };
   const euros = (c) => `${(c / 100).toFixed(2).replace(".", ",")} €`;
-  console.log("Teclas: 1 y 2 = monedas de 1 y 2 €; 5, 0, v y c = billetes de 5, 10, 20 y 50 €; q = salir.");
+  const lista = (unidades) =>
+    DENOMINACIONES.filter((v) => unidades[v] > 0)
+      .map((v) => `${unidades[v]} × ${euros(v)}`)
+      .join(", ") || "nada";
+  console.log("Teclas: 1 y 2 = monedas de 1 y 2 €; 5, 0, v y c = billetes de 5, 10, 20 y 50 €; n = lo que tiene; q = salir.");
   readline.emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.on("keypress", (tecla) => {
     if (tecla === "q" || tecla === "\u0003") {
       ck.cerrar();
       process.exit(0);
+    }
+    if (tecla === "n") {
+      console.log(`Para dar cambio (${euros(ck.totalCambio())}): ${lista(ck.maquina.cambio)}`);
+      console.log(`Cajón de recaudación (${euros(ck.totalRecaudacion())}): ${lista(ck.maquina.recaudacion)}`);
+      return;
     }
     const valor = teclas[tecla];
     if (!valor) return;
