@@ -4,7 +4,7 @@
 //   node pruebas/cashkeeper-de-mentira.mjs [--control 8001] [--consulta 8002] [--clave 100001]
 // En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; q sale.
 // Sigue el manual del integrador (§7, §8 y anexo 9.2): clave con 47/57/58, 39 Startup, 40 State, 42 Totalize, 9 Disable,
-// 29 Pay, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation, y los avisos 100 Disabled,
+// 29 Pay, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation, y los avisos 100 Disabled,
 // 104 ProcessInterrupted, 106 StateChange, 107 ValueIN y 108 ValueOUT. Las cantidades van en céntimos.
 import net from "node:net";
 import readline from "node:readline";
@@ -18,7 +18,7 @@ export function crearCashKeeper(opciones = {}) {
     consulta = 8002,
     clave = "100001",
     numero = 1620168189,
-    // Lo que mete «el cliente» en cada Totalize: (n, { objetivo, recarga }) => [valores] (en céntimos), uno cada `ritmo` ms.
+    // Lo que mete «el cliente» en cada Totalize o Enable: (n, { objetivo, recarga }) => [valores] (en céntimos), uno cada `ritmo` ms.
     cliente = null,
     ritmo = 200,
     // Simula un corte de la conexión de control al meter la moneda número `moneda` de un cobro de `objetivo` (una vez).
@@ -144,6 +144,18 @@ export function crearCashKeeper(opciones = {}) {
         if (m.autoclose && m.introducido >= m.objetivo) return terminarCobro();
         return empezarCliente();
       }
+      case "14": {
+        // Enable: acepta dinero sin importe (hasta un Totalize o un Disable).
+        if (m.estado !== 1) return responder("$14|0|2|Dispositivo ocupado. No se puede procesar el comando#");
+        m.objetivo = 0;
+        m.autoclose = false;
+        monedasDeEsta = 0;
+        responder("$14|1#");
+        cambiarEstado(2);
+        return empezarCliente();
+      }
+      case "43":
+        return responder(`$43|1|${m.introducido}#`);
       case "9": {
         if (m.estado !== 2 && m.estado !== 7) return responder("$9|0|36|El dispositivo no está habilitado. No se puede procesar el comando#");
         responder("$9|1#");

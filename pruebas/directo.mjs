@@ -3,7 +3,8 @@
 //   node pruebas/directo.mjs <programa>        (el .exe compilado, o tpvlucrapp-agente.mjs para probarlo con Node)
 // Casos, en orden (la máquina hace una cosa cada vez): A cobra 7,50 € con 10 € (vuelta 2,50 €); B es «Probar»; C se
 // cancela desde la caja con 5 € dentro (la máquina los devuelve); D devuelve 3 €; E pide pagar más de lo que hay (error);
-// F mete 10 € de cambio; G se corta a media cobro, vuelve y se sigue con lo que la máquina tenía.
+// F mete 10 € de cambio; G se corta a media cobro, vuelve y se sigue con lo que la máquina tenía; H es una entrada sin
+// importe: se mete lo que sea (15 €) y se acepta desde la caja.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
@@ -34,6 +35,7 @@ const ck = crearCashKeeper({
     if (objetivo === 2000) return [500];
     if (objetivo === 1000 && recarga) return [1000];
     if (objetivo === 400) return introducido === 0 ? [200, 200] : [200];
+    if (objetivo === 0 && recarga) return [1000, 500];
     return [];
   },
   cortar: { objetivo: 400, moneda: 1 },
@@ -48,6 +50,7 @@ const ops = [
   { ...directo, id: "op-E", tipo: "salida", ticket: "5", orden: null, importe_centimos: 99900 },
   { ...directo, id: "op-F", tipo: "entrada", ticket: "6", orden: null, importe_centimos: 1000 },
   { ...directo, id: "op-G", tipo: "cobro", ticket: "7", orden: null, importe_centimos: 400 },
+  { ...directo, id: "op-H", tipo: "entrada", ticket: "8", orden: null, importe_centimos: 0 },
 ];
 let entregadas = false;
 
@@ -78,7 +81,9 @@ const plataforma = http
         if (b.progreso) (progresos[estado[1]] ??= []).push(b.progreso);
         // La caja pide cancelar C en cuanto hay dinero dentro.
         const cancelar = estado[1] === "op-C" && (b.progreso?.introducido ?? 0) > 0;
-        return enviar({ estado: b.estado, cancelar });
+        // Y acepta la entrada H cuando ya hay 15 € dentro.
+        const terminar = estado[1] === "op-H" && (b.progreso?.introducido ?? 0) >= 1500;
+        return enviar({ estado: b.estado, cancelar, terminar });
       }
       res.writeHead(404);
       res.end("{}");
@@ -123,6 +128,10 @@ const bien =
   final("op-G")?.estado === "cobrada" &&
   r("op-G").introducido === 400 &&
   ck.maquina.cortes === 1 &&
+  final("op-H")?.estado === "cobrada" &&
+  r("op-H").introducido === 1500 &&
+  ck.maquina.ordenes.includes("14") &&
+  ck.maquina.ordenes.includes("42|1500|1") &&
   ck.maquina.startups >= 2 &&
   // Nunca Terminate (48) ni CloseAll (7): para cerrar basta con soltar la conexión.
   ck.maquina.prohibidas.length === 0;
@@ -133,5 +142,5 @@ if (!bien) {
     // sin registro
   }
 }
-console.log(bien ? "Bien: cobra con vuelta, cancela devolviendo, paga, mete cambio, avisa del error y sigue tras un corte." : "ALGO FALLA");
+console.log(bien ? "Bien: cobra con vuelta, cancela devolviendo, paga, mete cambio (también sin importe), avisa del error y sigue tras un corte." : "ALGO FALLA");
 process.exit(bien ? 0 : 1);
