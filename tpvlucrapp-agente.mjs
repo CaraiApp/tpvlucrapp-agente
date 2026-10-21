@@ -9,7 +9,8 @@
 //   · o en impresoras de red por IP (ESC/POS, puerto 9100).
 // Y le cuenta a la oficina qué impresoras tiene el ordenador, para darlas de alta con un toque.
 // Desde la 0.4.0 también lleva los cobros al cajón automático (CashKeeper): se los pasa a CKMonitor por CKFast y le
-// cuenta a la caja cómo van (cobrado, cancelado o el motivo si falla).
+// cuenta a la caja cómo van (cobrado, cancelado o el motivo si falla). Desde la 0.6.0, también sin CKMonitor: habla
+// directamente con la máquina (conexión de control) y la caja enseña en vivo lo que se mete y la vuelta.
 //
 // Instalar: en la oficina → Impresión y pantallas → «Conectar un ordenador»: descarga el programa, ábrelo y escribe el
 // código que sale en la oficina. En Windows pide permiso de administrador una vez (para arrancar solo con el ordenador).
@@ -20,11 +21,13 @@
 //   tpvlucrapp-agente --probar-impresora "EPSON TM-T20" prueba en una impresora del ordenador
 //   tpvlucrapp-agente --probar-cashkeeper 127.0.0.1:16501   comprueba que CKMonitor contesta (CKFast)
 //   tpvlucrapp-agente --leer-cashkeeper 192.168.1.20 [CLAVE]  lee el efectivo de la máquina (conexión de consulta)
+//   tpvlucrapp-agente --probar-directo 192.168.1.20 [CLAVE]   entra en la máquina sin CKMonitor (CKMonitor cerrado)
 //   tpvlucrapp-agente --desinstalar                     quitarlo de este ordenador
 //   (--servicio: lo usa el arranque automático · --enlazar CÓDIGO y --instalar: instalación sin preguntas)
 // Con Node.js 18+ también vale (node tpvlucrapp-agente.mjs), pero entonces no arranca solo: se queda en la ventana.
 // =====================================================================================
 import { execFile, execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -32,7 +35,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -587,6 +590,474 @@ function leerEfectivo(host, puerto, semilla, espera = 15000) {
     conexion.on("error", (error) => acabar(error));
   });
 }
+// Conexión directa con el CashKeeper, sin CKMonitor (desde la 0.6.0) ---------------------------------------------------
+// Manual del integrador §7 (CKeeper) y §8 (Raw Sockets), con el anexo 9.2. El programa abre la conexión de control de
+// la máquina (Host, puerto 8001), entra con la clave (como la consulta) y la arranca (39 Startup). La conexión se queda
+// abierta todo el día: si se corta, la máquina se cierra sola y hay que arrancarla otra vez; si se cortó a medio cobro, al
+// arrancar lo avisa (104 ProcessInterrupted) y se sigue con ese cobro. Una orden cada vez («$código|parámetros#» →
+// «$código|1|…#» o «$código|0|error|texto#»); los avisos de la máquina (códigos de 100 en adelante) llegan cuando
+// quieren: 100 Disabled (acabó lo que hacía), 104 ProcessInterrupted, 106 StateChange, 107 ValueIN (lo metido),
+// 108 ValueOUT (lo que sale), 110 Warning. Cobrar: 42 Totalize (con la vuelta automática); cancelar: 9 Disable con
+// devolución; pagar: 29 Pay; meter cambio: 67 ActivateRefillMode + 42 Totalize. Nunca 48 Terminate ni 7 CloseAll (para
+// cerrar basta con soltar la conexión). Con esta conexión, CKMonitor tiene que estar cerrado: la máquina tiene un dueño.
+
+const ESTADO_CK = ["cerrada", "en reposo", "esperando el dinero", "pagando", "llevando a recaudación", "vaciando", "en error", "contando el dinero"];
+/** Estados en los que la máquina estaba recogiendo dinero (para un corte a medias). */
+const RECOGIENDO = new Set([2, 7]);
+
+class MaquinaDirecta extends EventEmitter {
+  constructor(host, puerto, semilla) {
+    super();
+    this.setMaxListeners(50);
+    this.host = host;
+    this.puerto = Number(puerto) || 8001;
+    this.semilla = String(semilla || "100001");
+    this.conexion = null;
+    this.lista = false;
+    this.estado = 0;
+    this.pendiente = "";
+    this.esperando = null;
+    this.negociando = null;
+    this.conectando = null;
+    this.cola = Promise.resolve();
+    this.turno = Promise.resolve();
+    this.ocupada = false;
+    this.interrumpida = null;
+    this.mantener = false;
+    this.vigilancia = null;
+    this.fallos = 0;
+  }
+
+  get donde() {
+    return `${this.host}:${this.puerto}`;
+  }
+
+  /** Conectada, con la clave y arrancada (si no lo estaba, lo hace ahora). */
+  asegurar() {
+    if (this.lista) return Promise.resolve();
+    if (!this.conectando) this.conectando = this.#conectar().finally(() => (this.conectando = null));
+    return this.conectando;
+  }
+
+  async #conectar() {
+    const conexion = net.createConnection({ host: this.host, port: this.puerto });
+    conexion.setEncoding("latin1");
+    conexion.setNoDelay(true);
+    conexion.setKeepAlive(true, 10_000);
+    await new Promise((resolver, rechazar) => {
+      const tiempo = setTimeout(() => {
+        conexion.destroy();
+        rechazar(new Error(`La máquina no contesta en ${this.donde}`));
+      }, 8000);
+      conexion.once("connect", () => {
+        clearTimeout(tiempo);
+        resolver();
+      });
+      conexion.once("error", (error) => {
+        clearTimeout(tiempo);
+        rechazar(new Error(`No se puede conectar con la máquina en ${this.donde}: ${error.message}`));
+      });
+    });
+    this.conexion = conexion;
+    this.pendiente = "";
+    conexion.on("data", (trozo) => this.#recibir(trozo));
+    conexion.on("close", () => this.#cortada(conexion));
+    conexion.on("error", () => {});
+    try {
+      // La clave: StartCNT → CNT (número) → CNT (número + clave) → CNT_OK. Con la clave mala, la máquina cierra sin más.
+      const [numero] = await this.#negociar("$47#", "57");
+      const clave = Number(numero) + Number(this.semilla);
+      if (!Number.isSafeInteger(clave)) throw new Error("La máquina no ha dado el número para la clave");
+      await this.#negociar(`$57|${clave}#`, "58", "La máquina no acepta la clave (de serie 100001): revísala en la oficina");
+      // Arrancarla (abre sus dispositivos; si se cortó a medias, avisa con 104 antes de contestar).
+      try {
+        await this.#enviar(39, [0], 30_000);
+      } catch (error) {
+        if (error.codigo !== 49) throw error; // 49: ya estaba arrancada
+      }
+      this.lista = true;
+      this.fallos = 0;
+    } catch (error) {
+      conexion.destroy();
+      throw error;
+    }
+  }
+
+  #negociar(mensaje, codigo, siSeCierra) {
+    return new Promise((resolver, rechazar) => {
+      const tiempo = setTimeout(() => {
+        this.negociando = null;
+        rechazar(new Error(`La máquina no contesta al entrar (${this.donde})`));
+      }, 8000);
+      this.negociando = {
+        codigo,
+        siSeCierra,
+        resolver: (p) => (clearTimeout(tiempo), resolver(p)),
+        rechazar: (e) => (clearTimeout(tiempo), rechazar(e)),
+      };
+      this.conexion.write(Buffer.from(mensaje, "latin1"));
+    });
+  }
+
+  /** Una orden de bajo nivel (sin turno): la usan la conexión y `orden`. */
+  #enviar(codigo, parametros, espera) {
+    return new Promise((resolver, rechazar) => {
+      if (!this.conexion) return rechazar(new Error(`Sin conexión con la máquina en ${this.donde}`));
+      const tiempo = setTimeout(() => {
+        this.esperando = null;
+        rechazar(new Error(`La máquina no contesta (orden ${codigo})`));
+        // Una conexión que no contesta no es de fiar: se cierra y se vuelve a abrir.
+        this.conexion?.destroy();
+      }, espera);
+      this.esperando = {
+        codigo: String(codigo),
+        resolver: (p) => (clearTimeout(tiempo), resolver(p)),
+        rechazar: (e) => (clearTimeout(tiempo), rechazar(e)),
+      };
+      this.conexion.write(Buffer.from(`$${codigo}${parametros.length ? `|${parametros.join("|")}` : ""}#`, "latin1"));
+    });
+  }
+
+  /** Una orden a la máquina (de una en una): los datos tras el «1» o un error con el código y el texto de la máquina. */
+  orden(codigo, parametros = [], espera = 10_000) {
+    const turno = this.cola.then(async () => {
+      await this.asegurar();
+      return this.#enviar(codigo, parametros, espera);
+    });
+    this.cola = turno.catch(() => {});
+    return turno;
+  }
+
+  /** Las operaciones, de una en una: la máquina no puede cobrar y pagar a la vez. */
+  enTurno(trabajo) {
+    const turno = this.turno.then(trabajo);
+    this.turno = turno.catch(() => {});
+    return turno;
+  }
+
+  #recibir(trozo) {
+    this.pendiente += trozo;
+    for (let fin = this.pendiente.indexOf("#"); fin >= 0; fin = this.pendiente.indexOf("#")) {
+      const mensaje = this.pendiente.slice(0, fin);
+      this.pendiente = this.pendiente.slice(fin + 1);
+      const inicio = mensaje.indexOf("$");
+      if (inicio < 0) continue;
+      const [codigo, ...p] = mensaje.slice(inicio + 1).split("|").map((x) => x.trim());
+      if (this.negociando && codigo === this.negociando.codigo) {
+        const n = this.negociando;
+        this.negociando = null;
+        n.resolver(p);
+        continue;
+      }
+      if (Number(codigo) >= 100) {
+        this.#aviso(Number(codigo), p);
+        continue;
+      }
+      if (this.esperando && codigo === this.esperando.codigo) {
+        const e = this.esperando;
+        this.esperando = null;
+        if (p[0] === "1") e.resolver(p.slice(1));
+        else {
+          const error = new Error(p[2] ? `${p[2]} (error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
+          error.codigo = Number(p[1]);
+          e.rechazar(error);
+        }
+      }
+      // Otra respuesta suelta (no se esperaba): se ignora.
+    }
+  }
+
+  #aviso(codigo, p) {
+    if (codigo === 106) {
+      const antes = this.estado;
+      this.estado = Number(p[0]);
+      if (this.estado === 6 && antes !== 6) log(`✗ CashKeeper (directo) ${this.donde}: la máquina está en error`);
+    }
+    if (codigo === 104) {
+      this.interrumpida = { estado: Number(p[0]), valor: Number(p[1]) || 0, objetivo: Number(p[2]) || 0 };
+      log(`CashKeeper (directo) ${this.donde}: había algo a medias al cortarse (${ESTADO_CK[this.interrumpida.estado] ?? this.interrumpida.estado}: ${euros(this.interrumpida.valor)} de ${euros(this.interrumpida.objetivo)})`);
+    }
+    if (codigo === 110) log(`CashKeeper (directo) ${this.donde}: aviso de la máquina: ${p[1] ?? ""} (${p[0] ?? "?"})`);
+    this.emit(String(codigo), p);
+  }
+
+  #cortada(conexion) {
+    if (this.conexion !== conexion) return;
+    this.conexion = null;
+    this.lista = false;
+    this.estado = 0;
+    if (this.esperando) {
+      const e = this.esperando;
+      this.esperando = null;
+      e.rechazar(new Error(`Se cortó la conexión con la máquina en ${this.donde}`));
+    }
+    if (this.negociando) {
+      const n = this.negociando;
+      this.negociando = null;
+      n.rechazar(new Error(n.siSeCierra ?? `La máquina cerró la conexión en ${this.donde}`));
+    }
+    this.emit("cortada");
+  }
+
+  /** Tenerla conectada y arrancada todo el día (si se corta, vuelve sola), y comprobar cada 20 s que contesta. */
+  mantenerViva() {
+    if (this.mantener) return;
+    this.mantener = true;
+    const vuelta = async () => {
+      if (!this.mantener) return;
+      try {
+        if (!this.lista) {
+          await this.asegurar();
+          log(`✓ CashKeeper (directo): conectado con la máquina en ${this.donde} (${ESTADO_CK[this.estado] ?? this.estado})`);
+        } else if (!this.ocupada) {
+          await this.orden(40, [], 8000).catch((error) => {
+            if (!(error.codigo >= 0)) throw error; // contestó (aunque sea con error): sigue viva
+          });
+        }
+      } catch (error) {
+        this.fallos++;
+        if (this.fallos === 1 || this.fallos % 60 === 0) log(`✗ CashKeeper (directo): ${error.message}; se vuelve a intentar`);
+      }
+      if (this.mantener) this.vigilancia = setTimeout(vuelta, this.lista ? 20_000 : 5_000);
+    };
+    vuelta();
+  }
+
+  /** Dejarla (ya no es de este ordenador): se suelta la conexión y la máquina se cierra sola. */
+  soltar() {
+    this.mantener = false;
+    clearTimeout(this.vigilancia);
+    this.conexion?.destroy();
+  }
+}
+
+/** Una máquina por dirección (la misma conexión para todas sus operaciones). */
+const maquinasDirectas = new Map();
+function maquinaDirecta(host, puerto, semilla) {
+  const clave = `${host}:${Number(puerto) || 8001}`;
+  let m = maquinasDirectas.get(clave);
+  if (m && semilla && m.semilla !== String(semilla)) {
+    m.soltar();
+    m = null;
+  }
+  if (!m) {
+    m = new MaquinaDirecta(host, puerto, semilla);
+    maquinasDirectas.set(clave, m);
+  }
+  return m;
+}
+
+/** Las máquinas que la oficina dice que lleva este ordenador sin CKMonitor: se conectan y se mantienen. */
+function mantenerMaquinas(lista = []) {
+  const quedan = new Set();
+  for (const c of lista) {
+    const m = maquinaDirecta(c.host, c.puerto, c.semilla);
+    quedan.add(`${m.host}:${m.puerto}`);
+    m.mantenerViva();
+  }
+  for (const [clave, m] of maquinasDirectas) {
+    if (!quedan.has(clave) && m.mantener && !m.ocupada) {
+      m.soltar();
+      maquinasDirectas.delete(clave);
+    }
+  }
+}
+
+/** Espera a que la máquina vuelva tras un corte (como mucho `ms`). */
+async function esperarVuelta(m, ms) {
+  const limite = Date.now() + ms;
+  for (;;) {
+    try {
+      await m.asegurar();
+      return;
+    } catch (error) {
+      if (Date.now() > limite) throw error;
+      await dormir(3000);
+    }
+  }
+}
+
+/**
+ * Una operación por la conexión directa, de principio a fin. Meter dinero (cobro, entrada): 42 Totalize con la vuelta
+ * automática (en la entrada, antes 67: lo que entra va al cambio); cada segundo se cuenta cómo va (lo metido y la vuelta)
+ * y, si la caja pide cancelar, 9 Disable con devolución. Sacar dinero (devolución, salida): 29 Pay. Acaba cuando la
+ * máquina avisa (100 Disabled). Si la conexión se corta a medias, se espera a que vuelva y se sigue con lo que la
+ * máquina tenía (104 ProcessInterrupted). Nunca lanza.
+ */
+async function operarDirecto(op, avisar) {
+  const m = maquinaDirecta(op.host, op.puerto, op.semilla);
+  // Una máquina sin CKMonitor tiene que estar siempre conectada y arrancada (si no, no acepta dinero).
+  m.mantenerViva();
+  return m.enTurno(async () => {
+    m.ocupada = true;
+    try {
+      await operarEnMaquina(m, op, avisar);
+    } catch (error) {
+      log(`✗ CashKeeper (directo) ${m.donde}: ${error.message}`);
+      await avisar("error", error.message);
+    } finally {
+      m.ocupada = false;
+    }
+  });
+}
+
+async function operarEnMaquina(m, op, avisar) {
+  if (op.tipo === "prueba") {
+    await m.asegurar();
+    log(`✓ CashKeeper (directo): la máquina contesta en ${m.donde} (${ESTADO_CK[m.estado] ?? m.estado})`);
+    await avisar("cobrada", null, { estado: ESTADO_CK[m.estado] ?? String(m.estado) });
+    return;
+  }
+  const saca = op.tipo === "devolucion" || op.tipo === "salida";
+  const objetivo = op.importe_centimos + (op.propina_centimos ?? 0);
+  const que = { cobro: "cobro", entrada: "entrada de cambio", devolucion: "devolución", salida: "salida" }[op.tipo] ?? op.tipo;
+  const fem = op.tipo !== "cobro";
+  const hecha = fem ? "hecha" : "hecho";
+  const delQue = `${fem ? "de la" : "del"} ${que}`;
+  const progreso = { fase: "conectando", objetivo, introducido: 0, devuelto: 0 };
+  let cancelarPedido = false;
+  let ultimaCuenta = 0;
+  const contar = async (estado = "en_curso") => {
+    ultimaCuenta = Date.now();
+    const r = await avisar(estado, null, null, { ...progreso });
+    if (r?.cancelar) cancelarPedido = true;
+  };
+  // Cada moneda o billete se cuenta al momento (como mucho cada 0,3 s), para que la caja lo vea en vivo.
+  const contarYa = () => {
+    if (Date.now() - ultimaCuenta > 300) contar().catch(() => {});
+  };
+  await contar();
+  await esperarVuelta(m, 60_000);
+
+  // ¿Quedó algo a medias en la máquina (se cortó)? Si es esta misma operación (se retoma), se sigue; si no, lo metido se
+  // devuelve (nadie lo va a cobrar) y lo que se estaba pagando se da por terminado.
+  let seguir = false;
+  const corte = m.interrumpida;
+  m.interrumpida = null;
+  if (corte) {
+    const esEsta = op.reanudar && corte.objetivo === objetivo && (saca ? corte.estado === 3 : RECOGIENDO.has(corte.estado));
+    if (esEsta) {
+      seguir = true;
+      if (saca) progreso.devuelto = corte.valor;
+      else progreso.introducido = corte.valor;
+      log(`CashKeeper (directo): se sigue con ${fem ? "la" : "el"} ${que} de ${euros(objetivo)} (${euros(corte.valor)} ya hechos)`);
+    } else if (RECOGIENDO.has(corte.estado) && corte.valor > 0) {
+      log(`CashKeeper (directo): se devuelven ${euros(corte.valor)} de un cobro cortado que ya no espera nadie`);
+      await hastaQueAcabe(m, () => m.orden(42, [0, 1]), () => false).catch((error) => log(`✗ No se pudo devolver lo del cobro cortado: ${error.message}`));
+    } else if (corte.estado === 3) {
+      await m.orden(68).catch(() => {}); // DiscardPayOperation: el pago cortado no se repite solo
+    }
+  }
+
+  const alMeter = (p) => {
+    progreso.introducido = Number(p[0]) || 0;
+    progreso.fase = "metiendo";
+    contarYa();
+  };
+  const alSacar = (p) => {
+    progreso.devuelto = Number(p[0]) || 0;
+    progreso.fase = saca ? "pagando" : "devolviendo";
+    contarYa();
+  };
+  m.on("107", alMeter);
+  m.on("108", alSacar);
+  try {
+    let cancelando = false;
+    let porTiempo = false;
+    // Lo que se pidió en el último Pay (si se retoma un pago cortado, solo lo que faltaba).
+    let pedido = objetivo;
+    const limite = Date.now() + 20 * 60_000;
+    const empezar = async () => {
+      if (saca) {
+        const falta = Math.max(0, objetivo - (seguir ? progreso.devuelto : 0));
+        pedido = falta;
+        await m.orden(29, [falta, 0]); // Pay
+        progreso.fase = "pagando";
+      } else {
+        if (op.tipo === "entrada" && !seguir) await m.orden(67); // ActivateRefillMode: lo que entre, al cambio
+        await m.orden(42, [objetivo, 1]); // Totalize con vuelta automática
+        progreso.fase = progreso.introducido > 0 ? "metiendo" : "esperando";
+      }
+    };
+    for (;;) {
+      const fin = await hastaQueAcabe(m, empezar, async () => {
+        await contar().catch(() => {});
+        if (!saca && !cancelando && (cancelarPedido || Date.now() > limite)) {
+          cancelando = true;
+          porTiempo = !cancelarPedido;
+          progreso.fase = "cancelando";
+          await m.orden(9, [1]).catch((error) => log(`✗ CashKeeper (directo): no se pudo cancelar: ${error.message}`)); // Disable con devolución
+        }
+      });
+      if (fin.cortada) {
+        // Se cortó a medias: la máquina se cierra sola. Se espera a que vuelva y se sigue con lo que tenía.
+        log(`CashKeeper (directo): se cortó la conexión a mitad ${delQue}; se espera a la máquina`);
+        progreso.fase = "conectando";
+        await contar().catch(() => {});
+        await esperarVuelta(m, 5 * 60_000);
+        const corteAhora = m.interrumpida;
+        m.interrumpida = null;
+        if (corteAhora && corteAhora.objetivo === objetivo) {
+          seguir = true;
+          if (saca) progreso.devuelto = corteAhora.valor;
+          else progreso.introducido = corteAhora.valor;
+          if (cancelando && !saca) {
+            await hastaQueAcabe(m, () => m.orden(42, [0, 1]), () => false); // devolver lo metido
+            await avisar("cancelada", porTiempo ? "Nadie metió el dinero en 20 minutos: se ha devuelto lo introducido" : null, { ...progreso });
+            return;
+          }
+          continue;
+        }
+        throw new Error(`Se cortó la conexión con la máquina a mitad ${delQue} y al volver no tenía nada a medias: revisa la máquina`);
+      }
+      // La máquina terminó (100 Disabled): ErrorCode, ErrorDescription, lo hecho y lo pedido.
+      const hecho = fin.actual;
+      if (!saca && !fin.error && hecho >= objetivo) {
+        log(`✓ CashKeeper (directo): ${que} de ${euros(objetivo)} ${hecha} (metido ${euros(hecho)}${progreso.devuelto ? `, vuelta ${euros(progreso.devuelto)}` : ""})`);
+        await avisar("cobrada", null, { ...progreso, introducido: hecho, fase: "hecho" });
+      } else if (saca && !fin.error && hecho >= pedido) {
+        log(`✓ CashKeeper (directo): ${que} de ${euros(objetivo)} pagada`);
+        await avisar("cobrada", null, { ...progreso, devuelto: objetivo - pedido + hecho, fase: "hecho" });
+      } else if (cancelando && !fin.error) {
+        log(`✗ CashKeeper (directo): ${que} de ${euros(objetivo)} cancelad${fem ? "a" : "o"}${hecho ? ` (devuelto ${euros(hecho)})` : ""}`);
+        await avisar("cancelada", porTiempo ? "Nadie metió el dinero en 20 minutos: se ha devuelto lo introducido" : null, { ...progreso, fase: "cancelado" });
+      } else {
+        const motivo = fin.texto ? `${fin.texto} (error ${fin.error} de la máquina)` : `La máquina terminó sin acabar ${fem ? "la" : "el"} ${que} (${euros(hecho)} de ${euros(objetivo)})`;
+        log(`✗ CashKeeper (directo): ${que} de ${euros(objetivo)}: ${motivo}`);
+        await avisar("error", saca && hecho > 0 ? `${motivo}. Se llegaron a pagar ${euros(hecho)}` : motivo, { ...progreso });
+      }
+      return;
+    }
+  } finally {
+    m.off("107", alMeter);
+    m.off("108", alSacar);
+  }
+}
+
+/**
+ * Manda `empezar` y espera a que la máquina acabe (100 Disabled) o se corte la conexión. Mientras, cada segundo, `cada`.
+ * Devuelve { error, texto, actual, objetivo } o { cortada: true }.
+ */
+async function hastaQueAcabe(m, empezar, cada) {
+  let acabar;
+  const fin = new Promise((resolver) => (acabar = resolver));
+  const alAcabar = (p) => acabar({ error: Number(p[0]) || 0, texto: p[1] ?? "", actual: Number(p[2]) || 0, objetivo: Number(p[3]) || 0 });
+  const alCortar = () => acabar({ cortada: true });
+  m.once("100", alAcabar);
+  m.once("cortada", alCortar);
+  try {
+    await empezar();
+    for (;;) {
+      const resultado = await Promise.race([fin, dormir(1000).then(() => null)]);
+      if (resultado) return resultado;
+      await cada();
+    }
+  } finally {
+    m.off("100", alAcabar);
+    m.off("cortada", alCortar);
+  }
+}
+
 /** Las operaciones del cajón que se están llevando (cada una en paralelo: no frenan la impresión). */
 const cajonEnMarcha = new Set();
 
@@ -596,13 +1067,16 @@ const cajonEnMarcha = new Set();
  * un momento, sigue esperando: el cliente puede estar metiendo el dinero. Nunca lanza.
  */
 async function vigilarCajon(configuracion, op) {
-  const avisar = (estado, error, resultado) =>
+  const avisar = (estado, error, resultado, progreso) =>
     llamarApi(configuracion, "POST", `/cajon/${op.id}/estado`, {
       estado,
       ...(error ? { error: String(error).slice(0, 300) } : {}),
       ...(resultado ? { resultado } : {}),
+      ...(progreso ? { progreso } : {}),
     }).catch((fallo) => log(`No se pudo contar a la plataforma cómo va el cajón (${estado}): ${fallo.message}`));
   const donde = `${op.host}:${op.puerto}`;
+  // Sin CKMonitor: la conexión directa con la máquina (desde la 0.6.0).
+  if (op.modo === "directo" && op.tipo !== "consulta") return operarDirecto(op, avisar);
   try {
     // Leer el efectivo (no pasa por CKMonitor: va a la propia máquina, solo consulta).
     if (op.tipo === "consulta") {
@@ -766,6 +1240,7 @@ async function trabajar() {
         });
         const latido = await llamarApi(configuracion, "POST", "/latido", { version: VERSION, ...(impresoras ? { impresoras } : {}) });
         ultimoLatido = Date.now();
+        mantenerMaquinas(latido.cajones_directos ?? []);
         const lista = latido.impresoras.map((i) => i.nombre).join(", ");
         log(`Conectado como «${latido.agente.nombre}» · ${impresoras?.length ?? 0} impresoras en el ordenador · asignadas: ${lista || "ninguna todavía"}`);
       }
@@ -917,6 +1392,19 @@ if (orden === "--servicio") {
     );
   } catch (error) {
     await salir(1, `✗ ${error.message}`);
+  }
+} else if (orden === "--probar-directo") {
+  const [host, puerto = "8001"] = String(valor ?? "").split(":");
+  const clave = process.argv[4] ?? "100001";
+  if (!host) await salir(1, "Uso: tpvlucrapp-agente --probar-directo 192.168.1.20 [CLAVE] (la IP de la máquina y su clave; de serie 100001). CKMonitor tiene que estar cerrado.");
+  const m = maquinaDirecta(host, puerto, clave);
+  try {
+    await m.asegurar();
+    m.soltar();
+    await salir(0, `✓ Conectado con la máquina en ${host}:${puerto} sin CKMonitor: está ${ESTADO_CK[m.estado] ?? m.estado}.`);
+  } catch (error) {
+    m.soltar();
+    await salir(1, `✗ ${error.message}. ¿Está CKMonitor cerrado (la máquina solo admite un dueño) y la IP y la clave bien?`);
   }
 } else if (orden === "--enlazar") {
   try {
