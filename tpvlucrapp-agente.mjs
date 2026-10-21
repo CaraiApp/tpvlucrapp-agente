@@ -675,6 +675,8 @@ class MaquinaDirecta extends EventEmitter {
       } catch (error) {
         if (error.codigo !== 49) throw error; // 49: ya estaba arrancada
       }
+      // Un respiro para los avisos que llegan justo después de arrancar (su estado y, si se cortó a medias, el 104).
+      await dormir(300);
       this.lista = true;
       this.fallos = 0;
     } catch (error) {
