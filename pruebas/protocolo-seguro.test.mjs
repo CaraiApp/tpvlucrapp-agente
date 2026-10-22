@@ -1,0 +1,73 @@
+// Transporte TCP real local; servidor sintético, sin hardware ni credenciales del local.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import net from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { MaquinaDirecta, operarDirecto, leerEfectivo } from '../tpvlucrapp-agente.mjs';
+import { DiarioCashKeeper } from '../cashkeeper-seguro.mjs';
+async function escenario(t, fallo = '') {
+  const ordenes = []; const sockets = new Set();
+  const server = net.createServer(s => {
+    sockets.add(s); s.on('error', () => {}); s.on('close', () => sockets.delete(s));
+    let buffer = ''; const enviar = msg => s.write(msg);
+    s.on('data', trozo => {
+      buffer += trozo;
+      while (buffer.includes('#')) {
+        const i = buffer.indexOf('#'); const [c, ...p] = buffer.slice(1, i).split('|'); buffer = buffer.slice(i + 1);
+        ordenes.push([Number(c), ...p]);
+        if (c === '47') { enviar('$5'); setTimeout(() => !s.destroyed && enviar('7|123#'), 1); }
+        else if (c === '57') { assert.equal(p[0], '100124'); enviar('$58|TEST#'); }
+        else if (c === '39') enviar(`$39|1#${fallo === 'interrumpida' ? '$104|3|200|500|0#' : ''}$106|1|0#`);
+        else if (c === '38') enviar('$38|1|EUR|#');
+        else if (c === '40') enviar('$40|1|1#');
+        else if (c === '43') enviar('$43|1|0#');
+        else if (c === '29') {
+          if (fallo === 'corte') { s.destroy(); continue; }
+          if (fallo !== 'sin-ack') enviar('$29|1#');
+          enviar('$106|3|1#$108|500|500|0#$106|1|3#');
+          if (fallo !== 'sin-disabled') enviar('$100|0||500|500|3|0#');
+          if (fallo === 'duplicada') enviar('$100|0||500|500|3|0#');
+        } else throw new Error(`Orden no prevista: ${c}`);
+      }
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const puerto = server.address().port;
+  const m = new MaquinaDirecta('127.0.0.1', puerto, '100001');
+  m.intervalo = 5; m.timeoutOperacion = 100; m.mantenerViva = () => {};
+  const orden = m.orden.bind(m); m.orden = (c, p) => orden(c, p, 150);
+  const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), 'ck-tcp-'));
+  t.after(async () => { m.soltar(); for (const s of sockets) s.destroy(); await new Promise(r => server.close(r)); fs.rmSync(carpeta, { recursive: true, force: true }); });
+  const diario = new DiarioCashKeeper(carpeta);
+  const op = { id: 'tcp', tipo: 'salida', importe_centimos: 500, host: '127.0.0.1', puerto };
+  let final;
+  await operarDirecto(op, async (...r) => { final = r; }, { maquina: m, diario });
+  return { final, ordenes, diario, op, m };
+}
+for (const fallo of ['', 'duplicada']) test(`TCP handshake fragmentado y evento terminal ${fallo || 'normal'}`, async t => {
+  const r = await escenario(t, fallo); assert.equal(r.final[0], 'cobrada'); assert.equal(r.ordenes.filter(x => x[0] === 29).length, 1); assert.equal(r.diario.leer('tcp').final.resultado.fin.actual, 500);
+});
+for (const fallo of ['corte', 'sin-ack', 'sin-disabled', 'interrumpida']) test(`TCP ${fallo}: bloquea sin reenviar Pay ni Discard`, async t => {
+  const r = await escenario(t, fallo); assert.equal(r.final[0], 'error'); assert.equal(r.final[2].conciliar, true);
+  const antes = r.ordenes.length;
+  await operarDirecto({ ...r.op, id: 'otro' }, async () => {}, { maquina: r.m, diario: r.diario });
+  assert.equal(r.ordenes.length, antes); assert.ok(!r.ordenes.some(x => x[0] === 52));
+});
+
+for (const mala of [false,true]) test(`Office consulta sin Startup ni dinero, clave ${mala?'incorrecta':'correcta'}`, async t => {
+  const cmds=[];const ss=new Set();
+  const srv=net.createServer(s=>{ss.add(s);s.on('close',()=>ss.delete(s));s.on('data',b=>{const c=b.toString();cmds.push(c);
+    if(c==='$47#')s.write('$57|123#');
+    else if(c.startsWith('$57|')){if(mala)s.end();else s.write('$58|TEST#');}
+    else if(c==='$79|0#')s.write('$106|1|0#$79|1|100,100|3,2|EUR,USD#');
+    else if(c==='$17#')s.write('$17|1|EUR|500|2#');
+    else throw new Error('Office no admite '+c);
+  });});
+  srv.listen(0,'127.0.0.1');await new Promise(r=>srv.once('listening',r));
+  t.after(async()=>{for(const s of ss)s.destroy();await new Promise(r=>srv.close(r));});
+  const p=leerEfectivo('127.0.0.1',srv.address().port,mala?'1':'100001',500);
+  if(mala)await assert.rejects(p,/clave/);else {const r=await p;assert.equal(r.cambio[1].divisa,'USD');assert.equal(r.recaudacion[0].unidades,2);}
+  assert.ok(cmds.every(x=>/^\$(47|57|79|17)[|#]/.test(x)));
+});

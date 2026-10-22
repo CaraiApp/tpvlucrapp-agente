@@ -23,6 +23,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - name: Seguridad monetaria simulada
+        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs
       - name: Compilar
         run: bun build ./tpvlucrapp-agente.mjs --compile --target=bun-windows-x64 --outfile tpvlucrapp-agente-windows.exe
       - name: Cobra en el CashKeeper (plataforma y CKMonitor de mentira)
@@ -84,6 +86,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - name: Seguridad monetaria simulada
+        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs
       - name: Compilar (chip Apple e Intel)
         run: |
           bun build ./tpvlucrapp-agente.mjs --compile --target=bun-darwin-arm64 --outfile apple/tpvlucrapp-agente
