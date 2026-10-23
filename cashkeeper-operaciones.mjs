@@ -105,6 +105,8 @@ async function retirar(m, op, avisar) {
 }
 
 async function cambiar(m, avisar) {
+  // Comprobar compatibilidad antes de admitir efectivo. Un fallo de inventario no debe dejar una deuda nueva.
+  await inventario(m);
   const progreso = { fase: 'esperando', objetivo: 0, introducido: 0, devuelto: 0 };
   let accion;
   const contar = resultado => avisar('en_curso', null, resultado, { ...progreso });

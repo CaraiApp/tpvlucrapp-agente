@@ -208,7 +208,7 @@ export async function inventario(m) {
   } catch (error) {
     // GetLastLevels no existe en todos los modelos/configuraciones. Solo un rechazo
     // explícito admite otra consulta; una desconexión o datos corruptos no son ceros.
-    if (![34, 38, 39].includes(error.codigo)) throw error;
+    if (![34, 38, 39, 40].includes(error.codigo)) throw error;
   }
   if (!cambio.some(x => x.divisa === principal)) {
     let valores;
@@ -217,7 +217,7 @@ export async function inventario(m) {
       valores = [monedas, billetes].filter(Boolean).join(',').split(',').map(x => entero(x));
       if (!valores.length || valores.some(x => x <= 0) || new Set(valores).size !== valores.length) throw new Error('Denominaciones reconocidas no válidas');
     } catch (error) {
-      if (![34, 38, 39].includes(error.codigo) || principal !== 'EUR') throw error;
+      if (![34, 38, 39, 40].includes(error.codigo) || principal !== 'EUR') throw error;
       valores = EURO;
     }
     // null = nivel desconocido, no cero: se deberá consultar19 antes de usarlo.
@@ -230,7 +230,7 @@ export async function inventario(m) {
       const [actuales] = await m.orden(19, [principales]);
       leidos = niveles(principales, actuales, principal);
     } catch (error) {
-      if (error.codigo !== 39) throw error;
+      if (![39,40].includes(error.codigo)) throw error;
       // GetLastLevels puede incluir denominaciones sin reciclador (nivel cero).
       // Un solo valor no admitido invalida la consulta conjunta: aislarlo leyendo,
       // sin sustituir niveles actuales por la caché ni enviar órdenes de efectivo.

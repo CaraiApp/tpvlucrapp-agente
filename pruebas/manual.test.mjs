@@ -103,3 +103,33 @@ test('mensajes automáticos: excluye código protegido y delimitadores Raw',asyn
  const m=new Maquina();for(const h of [{codigo:1,texto:'TEXTO'},{codigo:24,texto:'TEXTO'},{codigo:17,texto:'$29#'}]) await assert.rejects(herramientaManual(m,{accion:'mensaje',confirmado:true,...h}));
  assert.ok(!m.ordenes.some(x=>x[0]===71));await herramientaManual(m,{accion:'mensaje',confirmado:true,codigo:17,texto:'TOTAL:'});assert.deepEqual(m.ordenes.find(x=>x[0]===71),[71,17,'TOTAL:']);
 });
+
+function cambioAceptado(t) {
+ const p={estado:2,valor:50,objetivo:0,operacion:0};
+ const e=contexto(t,'cambio',p,'devolver_cambio',{comando:52,fase:'cambio_aceptado',saldo:{introducido:50,devuelto:0}});
+ e.pedido.origen='cambio_sin_pago';e.maquina.interrumpida=null;e.maquina.credito=0;
+ e.diario.terminar(e.op.id,{estado:'error',error:'Value not supported. (orden79)',progreso:{fase:'metiendo',introducido:50,devuelto:0,objetivo:50},resultado:{conciliar:true,fin:{error:0,actual:50,objetivo:0,estado:2,operacion:0}}});
+ return e;
+}
+test('cambio aceptado sin pago: devuelve solo50 una vez, con evidencia durable y sin asiento',async t=>{
+ const e=cambioAceptado(t);await e.run();await e.run();
+ assert.deepEqual(e.maquina.ordenes.filter(x=>x[0]===29),[[29,50,0]]);
+ const final=e.diario.leer(e.op.id).final;assert.equal(final.estado,'cancelada');assert.equal(final.progreso.introducido,50);assert.equal(final.progreso.devuelto,50);assert.equal(final.resultado.recuperacion.origen,'cambio_sin_pago');
+});
+for(const caso of ['pago-enviado','saldo-distinto','devuelto','sin-diario','otro-fin','credito','interrumpida']) test(`cambio sin pago: bloquea evidencia incompatible ${caso}`,async t=>{
+ const e=cambioAceptado(t);const local=e.diario.leer(e.op.id);
+ if(caso==='pago-enviado')local.comando=29;
+ if(caso==='saldo-distinto')local.saldo.introducido=100;
+ if(caso==='devuelto')local.final.progreso.devuelto=1;
+ if(caso==='sin-diario')delete local.fase;
+ if(caso==='otro-fin')local.final.resultado.fin.estado=3;
+ if(caso==='credito')e.maquina.credito=50;
+ if(caso==='interrumpida')e.maquina.interrumpida=e.pedido.interrumpida;
+ e.diario.guardar(e.op.id,local);await e.run();assert.ok(!e.maquina.ordenes.some(x=>[29,42,52,68].includes(x[0])));assert.equal(e.diario.leer(e.op.id).final.resultado.conciliar,true);
+});
+for(const caso of ['corte','parcial','ack-perdido']) test(`cambio sin pago no duplica después de ${caso}`,async t=>{
+ const e=cambioAceptado(t);e.maquina.corte=caso==='corte';e.maquina.parcial=caso==='parcial';let perder=caso==='ack-perdido';
+ const informar=async(id,d)=>{if(d.estado==='cancelada'&&perder){perder=false;throw new Error('Sin ACK');}return {resuelta:d.estado==='cancelada'};};
+ for(let n=0;n<2;n++)await recuperarInterrupciones(e.maquina,e.op,e.diario,async()=>e.pedido,informar);
+ assert.equal(e.maquina.ordenes.filter(x=>x[0]===29).length,1);assert.equal(e.diario.leer(e.op.id).final.resultado.conciliar,caso!=='ack-perdido');
+});

@@ -42,7 +42,7 @@ No mueve dinero ni toca lo que hace CKMonitor. En el cajón (oficina → Editar)
 su pantalla) y, si el instalador la cambió, la clave. Para comprobarlo: `tpvlucrapp-agente --leer-cashkeeper
 192.168.1.20 [CLAVE]`.
 
-## CashKeeper directo y recuperación (0.8.1)
+## CashKeeper directo y recuperación (0.8.2)
 
 La conexión directa utiliza Raw Sockets del manual de integración V3. Se controla desde **Caja → CashKeeper**:
 
@@ -54,6 +54,10 @@ La conexión directa utiliza Raw Sockets del manual de integración V3. Se contr
 - Elegir denominaciones en una salida respetando el límite antiatraco. Una función no soportada no se sustituye por otra que ignore el límite.
 
 Desde la 0.8.1, la lectura funciona también cuando la máquina rechaza `GetLastLevels` (orden 79). Se descubren las denominaciones con la orden 78 o, en EUR, se consultan sus valores individualmente con la 19 si es necesario. Las cantidades siempre se leen de la máquina; un fallo de conexión no se interpreta como inventario vacío. Office y la conexión directa comparten esta lectura.
+
+La 0.8.2 incluye el rechazo explícito 40 en esas alternativas de lectura. «Dar cambio» comprueba el inventario antes de admitir dinero, para detectar incompatibilidades antes de comenzar.
+
+Si un cambio anterior aceptó dinero y falló antes de ordenar su devolución, el TPV conserva el importe recibido aunque el crédito de la máquina marque cero. Tras consultar su estado, el responsable puede solicitar «Devolver el cambio pendiente», confirmando que nadie lo devolvió por otra vía. El agente exige que su diario acredite la entrada aceptada, saldo sin devolver y ninguna orden de pago posterior; comprueba reposo y crédito cero antes de pagar una sola vez. Solo cierra la incidencia cuando se confirma la devolución completa. Un corte o pago parcial conserva el bloqueo; no se repite la orden.
 
 En **Ver monedas y billetes**, el TPV separa lo disponible para pagar de la recaudación. La salida manual muestra solo piezas disponibles, con botones + y − limitados a sus existencias. El agente comprueba las cantidades otra vez antes de ordenar el pago.
 

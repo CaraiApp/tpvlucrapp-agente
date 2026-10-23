@@ -244,3 +244,14 @@ test('salida específica sin existencias con orden79 no admitida: no paga ni cre
  const r=await ejecutar(op('salida',{importe_centimos:200,seleccion:[{valor:200,unidades:1}]}),e);
  assert.equal(r.estado,'error');assert.equal(r.resultado.conciliar,false);assert.ok(!e.maquina.ordenes.some(x=>[29,30,87].includes(x[0])));
 });
+
+test('Dar cambio no admite dinero si falla la consulta previa de inventario',async t=>{
+ const e=entorno(t);const original=e.maquina.orden.bind(e.maquina);
+ e.maquina.orden=async(c,p=[])=>{if(c===79)throw new Error('Sin respuesta de inventario');return original(c,p);};
+ const r=await ejecutar(op('cambio',{importe_centimos:0}),e,()=>({terminar:true}));
+ assert.equal(r.estado,'error');assert.equal(r.resultado.conciliar,false);assert.ok(!e.maquina.ordenes.some(x=>[14,9,29,30,52].includes(x[0])));
+});
+test('error40 explícito permite descubrir valores y leer individualmente, sin ocultar datos corruptos',async()=>{
+ const ordenes=[];const m={orden:async(c,p=[])=>{ordenes.push(c);if(c===38)return ['EUR'];if([79,78].includes(c)||c===19&&p[0].includes(','))throw Object.assign(new Error('Not supported values'),{codigo:40});if(c===19){if(p[0]==='100')return ['2'];throw Object.assign(new Error('No admitido'),{codigo:39});}if(c===17)return ['EUR','',''];throw new Error('Orden física inesperada');}};
+ assert.deepEqual((await inventario(m)).cambio,[{valor:100,unidades:2,divisa:'EUR'}]);assert.ok(ordenes.every(c=>[38,79,78,19,17].includes(c)));
+});
