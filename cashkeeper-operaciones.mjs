@@ -1,5 +1,5 @@
 // Operaciones físicas: ninguna respuesta OK sustituye a Disabled (§9.4.2).
-import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, inventario, entero, revision } from './cashkeeper-seguro.mjs';
+import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision } from './cashkeeper-seguro.mjs';
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 const total = xs => xs.reduce((s, x) => s + x.valor * x.unidades, 0);
 
@@ -13,10 +13,11 @@ export async function operarEnMaquina(m, op, avisar) {
   const abierta = op.tipo === 'entrada' && objetivo === 0;
   const progreso = { fase: 'conectando', objetivo, introducido: 0, devuelto: 0 };
   let accion = null;
+  const observado = { introducido: 0, devuelto: 0 };
   const limite = Date.now() + 20 * 60_000;
   const contar = () => avisar('en_curso', null, null, { ...progreso });
-  const meter = p => { progreso.introducido = entero(p[0]); progreso.fase = 'metiendo'; };
-  const sacar = p => { progreso.devuelto = entero(p[0]); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
+  const meter = p => { progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
+  const sacar = p => { progreso.devuelto = entero(p[0]); observado.devuelto = Math.max(observado.devuelto, progreso.devuelto); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
   m.on('107', meter); m.on('108', sacar);
   try {
     await contar();
@@ -47,6 +48,9 @@ export async function operarEnMaquina(m, op, avisar) {
     await comprobarFin(m, fin);
     if (saca) {
       if (fin.actual !== objetivo || fin.objetivo !== objetivo) throw revision('Pago parcial o importe distinto del solicitado');
+    } else if (accion === 'cancelar' && fin.actual === 0) {
+      await confirmarCancelacionVacia(m, fin, observado);
+      progreso.devuelto = 0;
     } else if (accion === 'aceptar') {
       const [credito] = await m.orden(43, [fin.operacion]);
       if (entero(credito) !== fin.actual) throw revision('El crédito no coincide con el importe aceptado');
@@ -97,8 +101,10 @@ async function cambiar(m, avisar) {
   const progreso = { fase: 'esperando', objetivo: 0, introducido: 0, devuelto: 0 };
   let accion;
   const contar = resultado => avisar('en_curso', null, resultado, { ...progreso });
-  const meter = p => { progreso.introducido = entero(p[0]); progreso.fase = 'metiendo'; };
-  m.on('107', meter);
+  const observado = { introducido: 0, devuelto: 0 };
+  const meter = p => { progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
+  const sacar = p => { observado.devuelto = Math.max(observado.devuelto, entero(p[0])); };
+  m.on('107', meter); m.on('108', sacar);
   let fin;
   const limite = Date.now() + 20 * 60_000;
   try {
@@ -110,10 +116,14 @@ async function cambiar(m, avisar) {
       if (r?.cancelar || Date.now() > limite) { accion = 'cancelar'; await m.orden(9, [1]); }
       else if (r?.terminar) { accion = 'aceptar'; await m.orden(9, [0]); }
     });
-  } finally { m.off('107', meter); }
+  } finally { m.off('107', meter); m.off('108', sacar); }
   await comprobarFin(m, fin);
   progreso.introducido = progreso.objetivo = fin.actual;
   if (accion === 'cancelar') {
+    if (fin.actual === 0) {
+      await confirmarCancelacionVacia(m, fin, observado);
+      return avisar('cancelada', null, { fin }, { ...progreso, fase: 'cancelado' });
+    }
     const [valor] = await m.orden(44); progreso.devuelto = entero(valor);
     if (progreso.devuelto !== fin.actual) throw revision('La cancelación no devolvió todo el crédito');
     await limpiarCreditoConfirmado(m, fin.operacion);

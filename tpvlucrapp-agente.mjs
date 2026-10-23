@@ -39,8 +39,8 @@ import { fileURLToPath } from "node:url";
 
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
-import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.7.1";
+import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, niveles, entero } from './cashkeeper-seguro.mjs';
+const VERSION = "0.7.2";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -61,6 +61,7 @@ const DATOS = process.env.TPV_AGENTE_DATOS ||
 const CONFIGURACION = path.join(DATOS, "agente.json");
 const REGISTRO = path.join(DATOS, "agente.log");
 const diarioCajon = new DiarioCashKeeper(path.join(DATOS, "cashkeeper-operaciones"));
+const conexionesCajon = new DiarioCashKeeper(path.join(DATOS, "cashkeeper-conexiones"));
 /** Dónde queda el programa instalado (lo arranca el sistema). */
 const INSTALADO =
   SISTEMA === "windows" ? path.join(process.env.ProgramFiles || "C:\\Program Files", "TPV Lucrapp", "tpvlucrapp-agente.exe") : path.join(DATOS, "tpvlucrapp-agente");
@@ -655,6 +656,7 @@ export class MaquinaDirecta extends EventEmitter {
       });
     });
     this.conexion = conexion;
+    if (this.pausada) { conexion.destroy(); throw new Error("CashKeeper desconectado por el encargado"); }
     this.pendiente = "";
     conexion.on("data", (trozo) => { try { this.#recibir(trozo); } catch { this.eventoInesperado = true; conexion.destroy(); } });
     conexion.on("close", () => this.#cortada(conexion));
@@ -809,7 +811,7 @@ export class MaquinaDirecta extends EventEmitter {
     if (this.mantener || this.pausada) return;
     this.mantener = true;
     const vuelta = async () => {
-      if (!this.mantener) return;
+      if (!this.mantener || this.pausada) return;
       try {
         if (!this.lista) {
           await this.asegurar();
@@ -847,6 +849,8 @@ function maquinaDirecta(host, puerto, semilla) {
   }
   if (!m) {
     m = new MaquinaDirecta(host, puerto, semilla);
+    m.pausada = conexionesCajon.leer(clave)?.pausada === true;
+    m.guardarPausa = pausada => conexionesCajon.guardar(clave, { pausada, actualizado: new Date().toISOString() });
     maquinasDirectas.set(clave, m);
   }
   return m;
@@ -1074,6 +1078,12 @@ async function trabajar() {
       }
       const { trabajos, cajon = [] } = await llamarApi(configuracion, "GET", "/trabajos?espera=25");
       fallos = 0;
+      for (const m of maquinasDirectas.values()) {
+        if (m.ocupada || m.pausada || !diarioCajon.pendientesVacios(m).length) continue;
+        await recuperarCancelacionesVacias(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
+          (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
+          .catch(error => log(`CashKeeper: no se pudo aplicar la revisión de la cancelación: ${error.message}`));
+      }
       // Los cobros del cajón, cada uno por su lado (pueden tardar minutos): la impresión sigue mientras.
       for (const operacion of cajon) {
         if (cajonEnMarcha.has(operacion.id)) continue;

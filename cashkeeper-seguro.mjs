@@ -86,7 +86,8 @@ export class DiarioCashKeeper {
     for (const f of fs.readdirSync(this.directorio).filter(f => f.endsWith('.json'))) {
       let previo;
       try { previo = JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); } catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
-      if (previo.maquina === maquina && (!previo.final || previo.final.resultado?.conciliar)) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
+      const conexion = op.tipo === 'mantenimiento' && ['conectar', 'desconectar'].includes(op.herramienta?.accion);
+      if (previo.maquina === maquina && (!previo.final || (previo.final.resultado?.conciliar && !conexion))) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
     }
     if (op.reanudar) throw revision('Operación ya enviada sin evidencia local durable. Requiere conciliación; no repetir.');
     this.guardar(op.id, { id: op.id, huella, maquina, tipo: op.tipo, objetivo: op.importe_centimos, iniciada: new Date().toISOString() });
@@ -94,6 +95,15 @@ export class DiarioCashKeeper {
   }
   terminar(id, final) { const anterior = this.leer(id); if (anterior) this.guardar(id, { ...anterior, final, terminada: new Date().toISOString() }); }
   avance(id, datos) { const anterior = this.leer(id); if (!anterior) throw revision('Falta el diario durable'); this.guardar(id, { ...anterior, ...datos }); }
+  pendientesVacios(op) {
+    if (!fs.existsSync(this.directorio)) return [];
+    const maquina = createHash('sha256').update(`${op.host.toLowerCase()}:${op.puerto}`).digest('hex');
+    return fs.readdirSync(this.directorio).filter(f => f.endsWith('.json')).map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); }
+      catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
+    }).filter(x => x.maquina === maquina && (esCancelacionVaciaAnterior(x) ||
+      (x.revision?.resolucion === 'cancelacion_vacia' && !x.revision.sincronizada && esCancelacionVaciaAnterior({ ...x, final: x.revision.anterior }))));
+  }
   bloquear(op) {
     fs.mkdirSync(this.directorio, { recursive: true, mode: 0o700 });
     const archivo = this.archivo(`lock:${op.host.toLowerCase()}:${op.puerto}`) + '.lock';
@@ -139,6 +149,43 @@ export async function limpiarCreditoConfirmado(m, operacion) {
   await m.orden(52, [operacion]);
   const [credito] = await m.orden(43, [operacion]);
   if (entero(credito) !== 0) throw revision('Sigue habiendo crédito pendiente después de finalizar');
+}
+/** ValueOUT (44) no identifica la operación. En una cancelación vacía no hay devolución que leer. */
+export async function confirmarCancelacionVacia(m, fin, observado) {
+  if (fin.error !== 0 || fin.actual !== 0 || fin.operacion !== 0 || fin.estado !== 2 || observado.introducido !== 0 || observado.devuelto !== 0 || m.eventoInesperado) throw revision('La cancelación vacía tiene evidencia contradictoria');
+  for (const operacion of [fin.operacion, 255]) {
+    const [credito] = await m.orden(43, [operacion]);
+    if (entero(credito) !== 0) throw revision('Sigue habiendo crédito: no se puede confirmar una cancelación vacía');
+  }
+}
+export function esCancelacionVaciaAnterior(x) {
+  const f = x?.final; const fin = f?.resultado?.fin; const p = f?.progreso;
+  return x?.tipo === 'cambio' && x.objetivo === 0 && x.comando === 9 && !x.saldo && !x.fase &&
+    f?.estado === 'error' && f.error === 'La cancelación no devolvió todo el crédito' && f.resultado?.conciliar === true &&
+    fin?.error === 0 && fin.actual === 0 && fin.objetivo === 0 && fin.operacion === 0 && fin.estado === 2 &&
+    p?.introducido === 0 && p.devuelto === 0 && p.objetivo === 0;
+}
+/** Solo aplica una revisión humana guardada en el servidor; conserva el error original y nunca reenvía dinero. */
+export async function recuperarCancelacionesVacias(m, op, diario, consultar, confirmar) {
+  return m.enTurno(async () => {
+    const liberar = diario.bloquear(op);
+    m.ocupada = true;
+    try {
+      for (const anterior of diario.pendientesVacios(op)) {
+        const r = await consultar(anterior.id);
+        if (r?.resolucion !== 'cancelacion_vacia' || r.id !== anterior.id || !r.revisada_en) continue;
+        await reposoSeguro(m);
+        let actual = diario.leer(anterior.id);
+        if (esCancelacionVaciaAnterior(actual)) {
+          actual = { ...actual, revision: { ...r, anterior: actual.final, aplicada_en: new Date().toISOString() },
+            final: { estado: 'cancelada', resultado: { fin: actual.final.resultado.fin, conciliar: false }, progreso: { ...actual.final.progreso, fase: 'cancelado' } } };
+          diario.guardar(anterior.id, actual);
+        }
+        if ((await confirmar(anterior.id, { estado: 1, credito: 0, interrumpida: false }))?.resuelta === true)
+          diario.guardar(anterior.id, { ...actual, revision: { ...actual.revision, sincronizada: true } });
+      }
+    } finally { m.ocupada = false; liberar(); }
+  });
 }
 export async function inventario(m) {
   const [principal] = await m.orden(38);
@@ -188,17 +235,27 @@ export async function herramienta(m, op, avisar) {
   }
   if (h.confirmado !== true) throw new Error('Falta confirmar la operación sensible');
   if (h.accion === 'conectar') {
-    m.pausada = false; await m.asegurar(); await reposoSeguro(m); m.mantenerViva();
-    return avisar('cobrada', null, { estado: 1 });
+    m.guardarPausa?.(false); m.pausada = false; await m.asegurar();
+    const d = await diagnostico(m); m.mantenerViva();
+    return avisar('cobrada', null, { ...d, pausada: false });
+  }
+  if (h.accion === 'desconectar') {
+    // Una incidencia terminal no impide cerrar. No descartar crédito ni interrumpir efectivo en curso.
+    let estado;
+    try { const [previo] = await m.orden(40); estado = entero(previo, 7); } catch { /* Sin comunicación: detener reconexiones sin afirmar que está cerrada. */ }
+    if (estado !== undefined && ![0, 1, 6].includes(estado)) throw new Error('La máquina está operando: termina o cancela antes de desconectar');
+    m.guardarPausa?.(true);
+    m.pausada = true;
+    let cerrado = estado === 0;
+    try {
+      if (estado !== undefined && !cerrado) {
+        await m.orden(7); // CloseAll conserva el servicio para la próxima conexión (§8.2.3).
+        const [final] = await m.orden(40); cerrado = entero(final, 7) === 0;
+      }
+    } catch { /* La pausa queda guardada; se conserva toda incidencia de efectivo. */ }
+    m.soltar(); return avisar('cobrada', null, { ...(cerrado ? { estado: 0 } : {}), pausada: true, cierre_confirmado: cerrado });
   }
   await reposoSeguro(m);
-  if (h.accion === 'desconectar') {
-    m.pausada = true;
-    await m.orden(7); // CloseAll cierra dispositivos, conserva servicio para la próxima conexión (§8.2.3).
-    const [estado] = await m.orden(40);
-    if (entero(estado, 7) !== 0) throw new Error('No se confirmó ALL_CLOSED');
-    m.soltar(); return avisar('cobrada', null, { estado: 0 });
-  }
   if (h.accion === 'configurar') {
     const lista = seleccion(h.denominaciones, 'estado');
     await m.orden(36, ['EUR', lista.map(x => x.valor).join(','), lista.map(x => x.estado).join(',')]);

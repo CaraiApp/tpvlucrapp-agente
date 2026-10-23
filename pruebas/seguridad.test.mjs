@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { operarDirecto } from '../tpvlucrapp-agente.mjs';
 import { operarCkfast } from '../cashkeeper-ckfast.mjs';
-import { DiarioCashKeeper, niveles, inventario } from '../cashkeeper-seguro.mjs';
+import { DiarioCashKeeper, niveles, inventario, recuperarCancelacionesVacias } from '../cashkeeper-seguro.mjs';
 
 class Maquina extends EventEmitter {
   constructor(fallo = '') { super(); Object.assign(this, { fallo, estado: 1, credito: 0, metido: 0, salida: 0, ordenes: [], intervalo: 1, timeoutOperacion: 40, turno: Promise.resolve(), cambio: 10, recaudacion: 3, transferido: 0 }); }
@@ -140,3 +140,78 @@ test('backend sin red al confirmar no convierte un pago confirmado en error', as
 test('inhibiciones lee las denominaciones reconocidas antes de consultar su estado', async t => { const e = entorno(t); const r = await ejecutar(op('mantenimiento', { herramienta: {accion:'inhibiciones'} }),e); assert.equal(r.estado,'cobrada'); assert.deepEqual(r.resultado.denominaciones,[{valor:100,estado:0}]); assert.deepEqual(e.maquina.ordenes.map(x=>x[0]),[78,21]); });
 test('configuración comprueba la lectura posterior y rechaza aceptar sin pagar billetes', async t => { const e = entorno(t); const r = await ejecutar(op('mantenimiento',{herramienta:{accion:'configurar',confirmado:true,denominaciones:[{valor:100,estado:0}]}}),e); assert.equal(r.estado,'cobrada'); const r2=await ejecutar(op('mantenimiento',{id:'invalid',herramienta:{accion:'configurar',confirmado:true,denominaciones:[{valor:500,estado:1}]}}),e); assert.equal(r2.estado,'error'); assert.equal(e.maquina.ordenes.filter(x=>x[0]===36).length,1); });
 test('desconexión confirma cerrado y conexión vuelve a reposo', async t => { const e = entorno(t); const a = await ejecutar(op('mantenimiento',{herramienta:{accion:'desconectar',confirmado:true}}),e); assert.equal(a.resultado.estado,0); const b=await ejecutar(op('mantenimiento',{id:'reconectar',herramienta:{accion:'conectar',confirmado:true}}),e); assert.equal(b.resultado.estado,1); });
+
+function cambioVacio(e, { credito = 0, observado = 0, error = 0 } = {}) {
+  const m = e.maquina, original = m.orden.bind(m);
+  m.orden = async (c, p = []) => {
+    if (c === 14) { m.antesDeEnviar?.(c); m.ordenes.push([c]); m.estado = 2; if (observado) m.emit('107', [String(observado),'0','0']); return []; }
+    if (c === 9) { m.antesDeEnviar?.(c); m.ordenes.push([c,...p]); m.estado = 1; m.credito = credito; m.emit('100', [String(error),'','0','0','2','0']); return []; }
+    return original(c,p);
+  };
+  m.salida = 5010; // ValueOUT conserva un pago anterior, no hay dinero en este cambio.
+}
+for (const tipo of ['cambio','entrada']) test(`${tipo}: cancelar vacío ignora ValueOUT anterior y no descarta ni paga`, async t => {
+  const e = entorno(t); cambioVacio(e);
+  const r = await ejecutar(op(tipo,{importe_centimos:0}),e,()=>({cancelar:true}));
+  assert.equal(r.estado,'cancelada'); assert.equal(r.progreso.introducido,0); assert.equal(r.progreso.devuelto,0);
+  assert.ok(!e.maquina.ordenes.some(x=>[29,30,44,52].includes(x[0])));
+  assert.equal((await ejecutar(op('salida',{id:'siguiente'}),e)).estado,'cobrada');
+});
+for (const [nombre, opciones] of [['crédito',{credito:100}],['evento contradictorio',{observado:100}],['Disabled error',{error:32}]]) test(`cancelación vacía no oculta ${nombre}`, async t => {
+  const e=entorno(t);cambioVacio(e,opciones);
+  const r=await ejecutar(op('cambio',{importe_centimos:0}),e,()=>({cancelar:true}));
+  assert.equal(r.estado,'error');assert.equal(r.resultado.conciliar,true);
+  assert.ok(!e.maquina.ordenes.some(x=>[29,30,52].includes(x[0])));
+});
+test('devolución parcial al cancelar cambio sigue bloqueando, sin descartar crédito', async t => {
+  const e=entorno(t), original=e.maquina.orden.bind(e.maquina);
+  e.maquina.orden=async(c,p)=>{const r=await original(c,p);if(c===9)e.maquina.salida=200;return r;};
+  const r=await ejecutar(op('cambio'),e,()=>({cancelar:true}));
+  assert.equal(r.resultado.conciliar,true);assert.ok(!e.maquina.ordenes.some(x=>x[0]===52));
+});
+test('desconectar con incidencia conserva el error y permite reconectar sin permitir pagar', async t => {
+  const e=entorno(t,'parcial');await ejecutar(op('salida'),e);e.maquina.credito=100;
+  const antes=e.diario.leer('op-1'); const pausas=[]; e.maquina.guardarPausa=p=>pausas.push(p);
+  const r=await ejecutar(op('mantenimiento',{id:'desconectar',herramienta:{accion:'desconectar',confirmado:true}}),e);
+  assert.equal(r.resultado.cierre_confirmado,true);assert.deepEqual(e.diario.leer('op-1'),antes);assert.deepEqual(pausas,[true]);
+  assert.ok(!e.maquina.ordenes.some(x=>x[0]===52));
+  const c=await ejecutar(op('mantenimiento',{id:'conectar',herramienta:{accion:'conectar',confirmado:true}}),e);
+  assert.equal(c.resultado.credito,100);assert.equal(c.resultado.conciliar,true);assert.deepEqual(pausas,[true,false]);
+  const pagos=e.maquina.ordenes.filter(x=>x[0]===29).length;
+  await ejecutar(op('salida',{id:'otra'}),e);assert.equal(e.maquina.ordenes.filter(x=>x[0]===29).length,pagos);
+});
+test('desconectar sin comunicación pausa sin inventar un cierre confirmado', async t => {
+  const e=entorno(t);e.maquina.orden=async()=>{throw new Error('Sin red');};let pausa;
+  e.maquina.guardarPausa=p=>{pausa=p;};
+  const r=await ejecutar(op('mantenimiento',{herramienta:{accion:'desconectar',confirmado:true}}),e);
+  assert.equal(pausa,true);assert.equal(r.estado,'cobrada');assert.equal(r.resultado.cierre_confirmado,false);assert.equal(r.resultado.estado,undefined);
+});
+test('desconectar mientras la máquina recibe no cierra ni descarta', async t => {
+  const e=entorno(t);e.maquina.estado=2;
+  const r=await ejecutar(op('mantenimiento',{herramienta:{accion:'desconectar',confirmado:true}}),e);
+  assert.equal(r.estado,'error');assert.ok(!e.maquina.ordenes.some(x=>[7,52].includes(x[0])));
+});
+function diarioVacio(e) {
+  const o=op('cambio',{importe_centimos:0});e.diario.iniciar(o);e.diario.avance(o.id,{comando:9,enviado:true});
+  e.diario.terminar(o.id,{estado:'error',error:'La cancelación no devolvió todo el crédito',resultado:{conciliar:true,fin:{error:0,texto:'',actual:0,objetivo:0,estado:2,operacion:0}},progreso:{fase:'esperando',objetivo:0,introducido:0,devuelto:0}});
+  return o;
+}
+test('revisión humana de vacío se sincroniza tras reiniciar, conserva original y no mueve dinero', async t => {
+  const e=entorno(t), o=diarioVacio(e), antes=e.diario.leer(o.id).final;
+  const revision=async id=>({id,resolucion:'cancelacion_vacia',revisada_en:new Date().toISOString()});
+  await assert.rejects(recuperarCancelacionesVacias(e.maquina,o,e.diario,revision,async()=>{throw new Error('sin red');}));
+  assert.equal(e.diario.leer(o.id).final.estado,'cancelada');
+  const nuevo=new DiarioCashKeeper(e.carpeta);let confirmaciones=0;
+  await recuperarCancelacionesVacias(e.maquina,o,nuevo,revision,async()=>{confirmaciones++;return {resuelta:true};});
+  assert.equal(confirmaciones,1);assert.deepEqual(nuevo.leer(o.id).revision.anterior,antes);assert.equal(nuevo.leer(o.id).revision.sincronizada,true);
+  assert.equal(nuevo.pendientesVacios(o).length,0);assert.ok(e.maquina.ordenes.every(x=>[38,40,43].includes(x[0])));
+});
+for(const caso of ['sin-revision','otro-id','credito','parcial']) test(`recuperación vacía rechaza ${caso}`, async t=>{
+  const e=entorno(t),o=diarioVacio(e);
+  if(caso==='credito')e.maquina.credito=10;
+  if(caso==='parcial'){const x=e.diario.leer(o.id);x.final.resultado.fin.actual=100;e.diario.guardar(o.id,x);}
+  const antes=e.diario.leer(o.id);let confirmaciones=0;
+  const f=()=>recuperarCancelacionesVacias(e.maquina,o,e.diario,async id=>({id:caso==='otro-id'?'otro':id,resolucion:caso==='sin-revision'?null:'cancelacion_vacia',revisada_en:'hoy'}),async()=>{confirmaciones++;return {resuelta:true};});
+  if(caso==='credito')await assert.rejects(f());else await f();
+  assert.deepEqual(e.diario.leer(o.id),antes);assert.equal(confirmaciones,0);
+});
