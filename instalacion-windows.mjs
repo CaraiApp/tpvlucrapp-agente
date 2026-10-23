@@ -4,7 +4,11 @@ import { randomUUID } from 'node:crypto';
 
 const literal = texto => `'${texto.replace(/'/g, "''")}'`;
 const esperar = ms => new Promise(resolve => setTimeout(resolve, ms));
-const ps = (ejecutar, codigo) => ejecutar('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(codigo, 'utf16le').toString('base64')]);
+const ps = (ejecutar, codigo) => ejecutar('powershell', ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', Buffer.from(`
+  $ProgressPreference='SilentlyContinue'
+  $ErrorActionPreference='Stop'
+  try { ${codigo}\n exit 0 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+`, 'utf16le').toString('base64')]);
 
 /** Solo cierra el ejecutable instalado; no otros programas ni copias descargadas. */
 export async function detenerEjecutableWindows(ejecutar, destino, propioPid = process.pid) {
