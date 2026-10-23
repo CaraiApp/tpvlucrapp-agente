@@ -42,6 +42,25 @@ No mueve dinero ni toca lo que hace CKMonitor. En el cajón (oficina → Editar)
 su pantalla) y, si el instalador la cambió, la clave. Para comprobarlo: `tpvlucrapp-agente --leer-cashkeeper
 192.168.1.20 [CLAVE]`.
 
+## CashKeeper directo y recuperación (0.8.0)
+
+La conexión directa utiliza Raw Sockets del manual de integración V3. Se controla desde **Caja → CashKeeper**:
+
+- Conectar y desconectar manualmente. La pausa se conserva al reiniciar Windows y no para la impresión.
+- Consultar estado, crédito, niveles, identificación, firmware y contadores. La consulta no mueve dinero.
+- Configurar denominaciones, máximos, mínimos, protecciones, limpieza, idioma y pantalla, según el modelo.
+- Aceptar o rechazar avisos de protección de cambio con autorización y plazo. Si nadie responde, se rechaza.
+- Recuperar una entrada o un pago interrumpido con evidencia de la máquina y del registro local. Un pago parcial se continúa solo por la diferencia. Una salida puede cerrarse con lo que realmente se entregó.
+- Elegir denominaciones en una salida respetando el límite antiatraco. Una función no soportada no se sustituye por otra que ignore el límite.
+
+Cancelar «Dar cambio» sin introducir dinero no crea un asiento de0€. Un corte o un resultado desconocido conserva la incidencia; no se repite la orden al reiniciar. Desconectar no borra crédito pendiente y no se permite durante una operación física activa.
+
+**Actualizar:** descarga y ejecuta la nueva versión en el ordenador enlazado. Actualizar la web no actualiza por sí solo el programa Windows. No borres su carpeta de datos: contiene el enlace y el diario que evita repetir operaciones.
+
+La recuperación necesita un diagnóstico reciente y coherente. Un atasco requiere actuación física; un corte durante la recuperación o dinero sin evidencia suficiente mantiene el bloqueo para revisión. No se actualiza firmware, cambia la red de la máquina ni fuerza inventario desde Caja. La operativa comercial es EUR; redondeos automáticos y aceptación multidivisa no están habilitados.
+
+La aplicación funciona en segundo plano, sin ventana propia. Los controles están en el TPV. El ejecutable Windows sigue sin firma de editor; esta versión no elimina SmartScreen.
+
 ## Dónde queda
 
 | | Windows | Mac |

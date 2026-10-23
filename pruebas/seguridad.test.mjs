@@ -47,7 +47,7 @@ class Maquina extends EventEmitter {
     if (c === 14) { this.estado = 2; this.metido = this.credito = 500; this.emit('107', ['500', '0', '0']); return []; }
     if (c === 9) { this.salida = p[0] === 1 ? this.metido : 0; this.fin(this.metido, 0); return []; }
     if (c === 42) { this.metido = this.credito = Number(p[0]) + 100; this.salida = 100; this.emit('107', [String(this.metido), String(p[0]), '0']); this.fin(this.metido, Number(p[0])); return []; }
-    if (c === 29 || c === 30) {
+    if (c === 29 || c === 30 || c === 87) {
       if (this.fallo === 'rechazo') throw Object.assign(new Error('No hay cambio'), { codigo: 32, rechazoSeguro: true });
       const pedido = c === 29 ? Number(p[0]) : p[0].split(',').reduce((s, v, i) => s + Number(v) * Number(p[1].split(',')[i]), 0);
       this.salida = this.fallo === 'parcial' ? pedido - 100 : pedido;
@@ -176,7 +176,7 @@ test('desconectar con incidencia conserva el error y permite reconectar sin perm
   assert.equal(r.resultado.cierre_confirmado,true);assert.deepEqual(e.diario.leer('op-1'),antes);assert.deepEqual(pausas,[true]);
   assert.ok(!e.maquina.ordenes.some(x=>x[0]===52));
   const c=await ejecutar(op('mantenimiento',{id:'conectar',herramienta:{accion:'conectar',confirmado:true}}),e);
-  assert.equal(c.resultado.credito,100);assert.equal(c.resultado.conciliar,true);assert.deepEqual(pausas,[true,false]);
+  assert.equal(c.resultado.credito,100);assert.equal(c.resultado.conciliar,false);assert.equal(c.resultado.requiere_revision,true);assert.deepEqual(pausas,[true,false]);
   const pagos=e.maquina.ordenes.filter(x=>x[0]===29).length;
   await ejecutar(op('salida',{id:'otra'}),e);assert.equal(e.maquina.ordenes.filter(x=>x[0]===29).length,pagos);
 });
@@ -214,4 +214,16 @@ for(const caso of ['sin-revision','otro-id','credito','parcial']) test(`recupera
   const f=()=>recuperarCancelacionesVacias(e.maquina,o,e.diario,async id=>({id:caso==='otro-id'?'otro':id,resolucion:caso==='sin-revision'?null:'cancelacion_vacia',revisada_en:'hoy'}),async()=>{confirmaciones++;return {resuelta:true};});
   if(caso==='credito')await assert.rejects(f());else await f();
   assert.deepEqual(e.diario.leer(o.id),antes);assert.equal(confirmaciones,0);
+});
+
+test('salida específica usa87, respeta unidades e importe y no sustituye denominaciones',async t=>{
+ const e=entorno(t);const r=await ejecutar(op('salida',{seleccion:[{valor:100,unidades:5}]}),e);
+ assert.equal(r.estado,'cobrada');assert.deepEqual(e.maquina.ordenes.find(x=>x[0]===87),[87,'100','5',0]);assert.ok(!e.maquina.ordenes.some(x=>[29,30].includes(x[0])));
+});
+for(const seleccion of [[{valor:100,unidades:4}],[{valor:200,unidades:3}]]) test('selección de salida inválida no mueve efectivo '+JSON.stringify(seleccion),async t=>{
+ const e=entorno(t);const r=await ejecutar(op('salida',{seleccion}),e);assert.equal(r.estado,'error');assert.equal(r.resultado.conciliar,false);assert.ok(!e.maquina.ordenes.some(x=>[29,30,87].includes(x[0])));
+});
+test('desconectar tras un reinicio conserva el diario sin finalizar y no descarta dinero',async t=>{
+ const e=entorno(t);e.diario.iniciar(op('salida'));const antes=e.diario.leer('op-1');
+ const r=await ejecutar(op('mantenimiento',{id:'desconectar',herramienta:{accion:'desconectar',confirmado:true}}),e);assert.equal(r.estado,'cobrada');assert.deepEqual(e.diario.leer('op-1'),antes);assert.ok(!e.maquina.ordenes.some(x=>[29,52,68].includes(x[0])));
 });

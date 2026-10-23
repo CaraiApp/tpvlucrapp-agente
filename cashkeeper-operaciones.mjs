@@ -1,5 +1,5 @@
 // Operaciones físicas: ninguna respuesta OK sustituye a Disabled (§9.4.2).
-import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision } from './cashkeeper-seguro.mjs';
+import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision, seleccion } from './cashkeeper-seguro.mjs';
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 const total = xs => xs.reduce((s, x) => s + x.valor * x.unidades, 0);
 
@@ -12,6 +12,13 @@ export async function operarEnMaquina(m, op, avisar) {
   entero(objetivo);
   const abierta = op.tipo === 'entrada' && objetivo === 0;
   const progreso = { fase: 'conectando', objetivo, introducido: 0, devuelto: 0 };
+  let piezas;
+  if (op.seleccion) {
+    if (op.tipo !== 'salida') throw new Error('La selección solo se admite en una salida');
+    piezas = seleccion(op.seleccion);
+    const niveles = await inventario(m);
+    if (total(piezas) !== objetivo || piezas.some(x => x.unidades <= 0 || x.unidades > (niveles.cambio.find(y => y.valor===x.valor && y.divisa==='EUR')?.unidades ?? 0))) throw new Error('La selección no coincide con el importe o supera el cambio disponible');
+  }
   let accion = null;
   const observado = { introducido: 0, devuelto: 0 };
   const limite = Date.now() + 20 * 60_000;
@@ -22,7 +29,7 @@ export async function operarEnMaquina(m, op, avisar) {
   try {
     await contar();
     const fin = await hastaDisabled(m, async () => {
-      if (saca) { progreso.fase = 'pagando'; await m.orden(29, [objetivo, 0]); }
+      if (saca) { progreso.fase = 'pagando'; if(piezas) await m.orden(87,[piezas.map(x=>x.valor).join(','),piezas.map(x=>x.unidades).join(','),0]); else await m.orden(29, [objetivo, 0]); }
       else {
         if (op.tipo === 'entrada') { await m.orden(67); await m.orden(14); }
         if (!abierta) await m.orden(42, [objetivo, 1]);

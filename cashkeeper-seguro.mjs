@@ -1,5 +1,6 @@
 // Contrato de seguridad Raw Sockets. Manual V.3, revisión 09/07/2026, §§7.2, 8.2, 9.2 y 9.4.2.
 import fs from 'node:fs';
+import { ACCIONES_MANUAL, CONSULTAS_MANUAL, herramientaManual } from './cashkeeper-configuracion.mjs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -75,7 +76,7 @@ export class DiarioCashKeeper {
     if (process.platform !== 'win32') { const d = fs.openSync(this.directorio, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } }
   }
   iniciar(op) {
-    const huella = createHash('sha256').update(JSON.stringify([op.host.toLowerCase(), op.puerto, op.tipo, op.importe_centimos, op.propina_centimos ?? 0, op.vaciar, op.herramienta, op.orden])).digest('hex');
+    const huella = createHash('sha256').update(JSON.stringify([op.host.toLowerCase(), op.puerto, op.tipo, op.importe_centimos, op.propina_centimos ?? 0, op.vaciar, op.herramienta, op.orden, ...(op.seleccion ? [op.seleccion] : [])])).digest('hex');
     const anterior = this.leer(op.id);
     if (anterior) {
       if (anterior.huella !== huella) throw revision('La operación ya existe con otros datos; no se repetirá');
@@ -87,10 +88,10 @@ export class DiarioCashKeeper {
       let previo;
       try { previo = JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); } catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
       const conexion = op.tipo === 'mantenimiento' && ['conectar', 'desconectar'].includes(op.herramienta?.accion);
-      if (previo.maquina === maquina && (!previo.final || (previo.final.resultado?.conciliar && !conexion))) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
+      if (previo.maquina === maquina && !conexion && (!previo.final || previo.final.resultado?.conciliar)) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
     }
     if (op.reanudar) throw revision('Operación ya enviada sin evidencia local durable. Requiere conciliación; no repetir.');
-    this.guardar(op.id, { id: op.id, huella, maquina, tipo: op.tipo, objetivo: op.importe_centimos, iniciada: new Date().toISOString() });
+    this.guardar(op.id, { id: op.id, huella, maquina, tipo: op.tipo, objetivo: op.importe_centimos, propina: op.propina_centimos ?? 0, iniciada: new Date().toISOString() });
     return null;
   }
   terminar(id, final) { const anterior = this.leer(id); if (anterior) this.guardar(id, { ...anterior, final, terminada: new Date().toISOString() }); }
@@ -103,6 +104,15 @@ export class DiarioCashKeeper {
       catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
     }).filter(x => x.maquina === maquina && (esCancelacionVaciaAnterior(x) ||
       (x.revision?.resolucion === 'cancelacion_vacia' && !x.revision.sincronizada && esCancelacionVaciaAnterior({ ...x, final: x.revision.anterior }))));
+  }
+  pendientesRecuperacion(op) {
+    if (!fs.existsSync(this.directorio)) return [];
+    const maquina = createHash('sha256').update(`${op.host.toLowerCase()}:${op.puerto}`).digest('hex');
+    return fs.readdirSync(this.directorio).filter(f => f.endsWith('.json')).map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); }
+      catch { throw revision('Diario ilegible: requiere revisión'); }
+    }).filter(x => x.maquina === maquina && ['cobro','entrada','salida','devolucion','cambio'].includes(x.tipo) &&
+      (!x.final || x.final.resultado?.conciliar || (x.recuperacion && !x.recuperacion.sincronizada)));
   }
   bloquear(op) {
     fs.mkdirSync(this.directorio, { recursive: true, mode: 0o700 });
@@ -127,12 +137,13 @@ export class DiarioCashKeeper {
   }
 }
 
-export const esConsultaHerramienta = op => op.tipo === 'mantenimiento' && ['diagnostico', 'niveles', 'inhibiciones'].includes(op.herramienta?.accion);
-export async function diagnostico(m) {
+export const esConsultaHerramienta = op => op.tipo === 'mantenimiento' && ['diagnostico', 'niveles', 'inhibiciones', ...CONSULTAS_MANUAL].includes(op.herramienta?.accion);
+export async function diagnostico(m, leerUltimaSalida = false) {
   await m.asegurar();
   const [estado] = await m.orden(40);
   const [credito] = await m.orden(43, [255]);
-  return { estado: entero(estado, 7), credito: entero(credito), interrumpida: m.interrumpida ?? null, conciliar: !!m.interrumpida || entero(credito) > 0 || !!m.eventoInesperado };
+  const ultimaSalida = leerUltimaSalida ? entero((await m.orden(44))[0]) : undefined;
+  return { ...(m.observaciones?.() ?? {}), estado: entero(estado, 7), credito: entero(credito), ...(ultimaSalida !== undefined ? {ultima_salida:ultimaSalida} : {}), interrumpida: m.interrumpida ?? null, conciliar: entero(estado, 7) !== 1 || !!m.interrumpida || entero(credito) > 0 || !!m.eventoInesperado };
 }
 export async function reposoSeguro(m) {
   const d = await diagnostico(m);
@@ -222,7 +233,8 @@ export async function inventario(m) {
 export async function herramienta(m, op, avisar) {
   const h = op.herramienta;
   if (!h) throw new Error('Falta la herramienta');
-  if (h.accion === 'diagnostico') return avisar('cobrada', null, await diagnostico(m));
+  if (ACCIONES_MANUAL.includes(h.accion)) return avisar('cobrada', null, await herramientaManual(m, h));
+  if (h.accion === 'diagnostico') return avisar('cobrada', null, await diagnostico(m,true));
   if (h.accion === 'niveles') return avisar('cobrada', null, await inventario(m));
   if (h.accion === 'inhibiciones') {
     const [monedas, billetes] = await m.orden(78, ['EUR']);
@@ -237,7 +249,7 @@ export async function herramienta(m, op, avisar) {
   if (h.accion === 'conectar') {
     m.guardarPausa?.(false); m.pausada = false; await m.asegurar();
     const d = await diagnostico(m); m.mantenerViva();
-    return avisar('cobrada', null, { ...d, pausada: false });
+    return avisar('cobrada', null, { ...d, conciliar: false, requiere_revision: d.conciliar, pausada: false });
   }
   if (h.accion === 'desconectar') {
     // Una incidencia terminal no impide cerrar. No descartar crédito ni interrumpir efectivo en curso.

@@ -81,3 +81,24 @@ for (const mala of [false,true]) test(`Office consulta sin Startup ni dinero, cl
   if(mala)await assert.rejects(p,/clave/);else {const r=await p;assert.equal(r.cambio[1].divisa,'USD');assert.equal(r.recaudacion[0].unidades,2);}
   assert.ok(cmds.every(x=>/^\$(47|57|79|17)[|#]/.test(x)));
 });
+
+for (const caso of ['aceptar','caducar','error']) test(`TCP eventos manual: ${caso}`, async t => {
+  let cliente; let estado=caso==='error'?6:1;const ordenes=[];
+  const srv=net.createServer(s=>{cliente=s;s.on('error',()=>{});let b='';s.on('data',d=>{b+=d;while(b.includes('#')){const i=b.indexOf('#');const [c]=b.slice(1,i).split('|');b=b.slice(i+1);ordenes.push(Number(c));
+    if(c==='47')s.write('$57|123#');else if(c==='57')s.write('$58|TEST#');else if(c==='39')s.write(`$39|1#$106|${estado}|0#`);
+    else if(c==='40')s.write(`$40|1|${estado}#`);else if(c==='43')s.write('$43|1|0#');else if(c==='7'){estado=0;s.write('$7|1#');}
+    else if(['3','32'].includes(c))s.write(`$${c}|1#`);else throw new Error(`No se permite ${c}`);
+  }});});
+  await new Promise(r=>srv.listen(0,'127.0.0.1',r));
+  const m=new MaquinaDirecta('127.0.0.1',srv.address().port,'100001');m.plazoPregunta=80;
+  t.after(async()=>{m.soltar();cliente?.destroy();await new Promise(r=>srv.close(r));});
+  await m.asegurar();
+  if(caso==='error'){assert.equal(m.estado,6);await m.orden(7);assert.deepEqual(await m.orden(40),['0']);return;}
+  cliente.write('$102|100,500|2,1#$113|1#$110|9|Retire billete#$105|5000|500|10000|0#');
+  await new Promise(r=>setTimeout(r,15));
+  const p=m.observaciones().pregunta;assert.equal(p.tipo,'proteccion_cambio');assert.equal(m.observaciones().billete_pendiente,true);assert.equal(m.observaciones().niveles_bajos.length,2);
+  await m.responderPregunta('id-equivocado',true);assert.ok(!ordenes.includes(3));
+  if(caso==='aceptar'){await m.responderPregunta(p.id,true);await m.responderPregunta(p.id,true);assert.equal(ordenes.filter(x=>x===3).length,1);assert.equal(m.observaciones().pregunta,null);}
+  else {await new Promise(r=>setTimeout(r,110));assert.equal(ordenes.filter(x=>x===32).length,1);assert.ok(!ordenes.includes(3));}
+  cliente.write('$113|0#');await new Promise(r=>setTimeout(r,10));assert.equal(m.observaciones().billete_pendiente,false);
+});

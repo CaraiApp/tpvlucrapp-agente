@@ -29,6 +29,7 @@
 // Con Node.js 18+ también vale (node tpvlucrapp-agente.mjs), pero entonces no arranca solo: se queda en la ventana.
 // =====================================================================================
 import { execFile, execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
@@ -38,9 +39,10 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
+import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.7.2";
+const VERSION = "0.8.0";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -622,6 +624,7 @@ export class MaquinaDirecta extends EventEmitter {
     this.vigilancia = null;
     this.fallos = 0;
     this.pausada = false;
+    this.avisos = []; this.nivelesBajos = []; this.billetePendiente = false; this.pregunta = null; this.timerPregunta = null;
   }
 
   get donde() {
@@ -677,7 +680,7 @@ export class MaquinaDirecta extends EventEmitter {
       await dormir(300);
       const [estado] = await this.#enviar(40, [], 8000);
       this.estado = entero(estado, 7);
-      if (this.estado !== 1) throw new Error("Startup no alcanzó IDLE");
+      if (![1, 6].includes(this.estado)) throw new Error("Startup no alcanzó un estado que permita consultar o recuperar");
       this.lista = true;
       this.fallos = 0;
     } catch (error) {
@@ -765,7 +768,7 @@ export class MaquinaDirecta extends EventEmitter {
         else {
           const error = new Error(p[2] ? `${p[2]} (orden ${codigo}, error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
           error.codigo = Number(p[1]);
-          error.rechazoSeguro = codigo === "29" && [2, 4, 32, 36, 37].includes(error.codigo);
+          error.rechazoSeguro = (codigo === "29" && [2, 4, 32, 36, 37].includes(error.codigo)) || (codigo === "87" && [2,4,32,34,36,37,38,39,40].includes(error.codigo));
           e.rechazar(error);
         }
       }
@@ -773,7 +776,33 @@ export class MaquinaDirecta extends EventEmitter {
     }
   }
 
+  observaciones() { return { avisos: this.avisos.slice(-20), niveles_bajos: this.nivelesBajos, billete_pendiente: this.billetePendiente, pregunta: this.pregunta }; }
+
+  async responderPregunta(id, aceptar) {
+    if (!this.pregunta || this.pregunta.id !== id) return;
+    const vigente = Date.now() < Date.parse(this.pregunta.vence_en);
+    clearTimeout(this.timerPregunta); this.timerPregunta = null; this.pregunta = null;
+    await this.orden(aceptar && vigente ? 3 : 32);
+  }
+
   #aviso(codigo, p) {
+    if ([107, 108, 109].includes(codigo) && p[2] !== '0') this.eventoInesperado = true;
+    if (codigo === 102) this.nivelesBajos = niveles(p[0], p[1], 'EUR');
+    if (codigo === 113) this.billetePendiente = entero(p[0], 1) === 1;
+    if (codigo === 110) {
+      this.avisos.push({ codigo: entero(p[0], 10000), texto: String(p[1] ?? '').slice(0, 300), recibido_en: new Date().toISOString() });
+      this.avisos = this.avisos.slice(-20);
+    }
+    if ([103, 105].includes(codigo)) {
+      if (this.pregunta || (codigo === 105 && p[3] !== '0')) { this.eventoInesperado = true; return; }
+      const id = randomUUID();
+      this.pregunta = { id, tipo: codigo === 103 ? 'muchas_monedas' : 'proteccion_cambio', vence_en: new Date(Date.now() + (this.plazoPregunta ?? 50000)).toISOString(),
+        ...(codigo === 103 ? { denominaciones: niveles(p[0], p[1], 'EUR') } : { valor: entero(p[0]), necesario: entero(p[1]), disponible: entero(p[2]) }) };
+      this.timerPregunta = setTimeout(() => { void this.responderPregunta(id, false).catch(() => { this.eventoInesperado = true; }); }, this.plazoPregunta ?? 50000);
+      this.timerPregunta.unref?.();
+    }
+    if (codigo === 100) { clearTimeout(this.timerPregunta); this.timerPregunta = null; this.pregunta = null; }
+
     if (codigo === 106) {
       const antes = this.estado;
       this.estado = Number(p[0]);
@@ -793,6 +822,7 @@ export class MaquinaDirecta extends EventEmitter {
     this.conexion = null;
     this.lista = false;
     this.estado = 0;
+    clearTimeout(this.timerPregunta); this.timerPregunta = null; this.pregunta = null;
     if (this.esperando) {
       const e = this.esperando;
       this.esperando = null;
@@ -884,10 +914,16 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
       if (progreso) { ultimoProgreso = progreso; if (iniciada && !consulta) diario.avance(op.id, { progreso }); }
       if (estado !== "en_curso" && !progreso) progreso = ultimoProgreso;
       // Toda incertidumbre mantiene bloqueada la máquina, también tras reiniciar.
-      if (estado === "error" && !consulta) resultado = { ...(resultado ?? {}), conciliar: enviado || revision };
+      if (estado === "error" && !consulta) {
+        const soloAjustes = op.tipo === "mantenimiento" && ["configurar", "guardar_niveles", "guardar_propiedades", "limpiar", "idioma", "pantalla", "mensaje"].includes(op.herramienta?.accion);
+        resultado = { ...(resultado ?? {}), conciliar: soloAjustes ? false : enviado || revision };
+      }
+      if (m.observaciones) resultado = { ...(resultado ?? {}), ...m.observaciones() };
       const cuerpo = { estado, ...(error ? { error: String(error).slice(0, 300) } : {}), ...(resultado ? { resultado } : {}), ...(progreso ? { progreso } : {}) };
       if (iniciada && estado !== "en_curso" && !consulta) { diario.terminar(op.id, cuerpo); finalGuardada = cuerpo; }
-      return avisar(estado, error, resultado, progreso);
+      const respuesta = await avisar(estado, error, resultado, progreso);
+      if (respuesta?.decision && m.responderPregunta) await m.responderPregunta(respuesta.decision.id, respuesta.decision.aceptar === true);
+      return respuesta;
     };
     try {
       if (!consulta) {
@@ -897,7 +933,7 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
         if (previo) { revision = true; throw new Error("Operación iniciada antes de reiniciar: requiere conciliación. No se repite."); }
         iniciada = true;
         m.antesDeEnviar = codigo => {
-          if ([7, 9, 11, 12, 13, 14, 29, 30, 36, 42, 52, 67].includes(codigo)) { diario.avance(op.id, { comando: codigo, enviado: true }); enviado = true; }
+          if ([3, 6, 7, 9, 10, 11, 12, 13, 14, 27, 29, 30, 32, 35, 36, 42, 52, 60, 67, 68, 70, 71, 87].includes(codigo)) { diario.avance(op.id, { comando: codigo, enviado: true }); enviado = true; }
         };
         m.marcarRevision = (fase, saldo) => { revision = true; diario.avance(op.id, { fase, ...(saldo ? { saldo } : {}) }); };
       }
@@ -1079,10 +1115,17 @@ async function trabajar() {
       const { trabajos, cajon = [] } = await llamarApi(configuracion, "GET", "/trabajos?espera=25");
       fallos = 0;
       for (const m of maquinasDirectas.values()) {
-        if (m.ocupada || m.pausada || !diarioCajon.pendientesVacios(m).length) continue;
+        if (m.ocupada || m.pausada) continue;
         await recuperarCancelacionesVacias(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
           (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
           .catch(error => log(`CashKeeper: no se pudo aplicar la revisión de la cancelación: ${error.message}`));
+        if (diarioCajon.pendientesRecuperacion(m).length && !m.recuperando) {
+          m.recuperando = true;
+          void recuperarInterrupciones(m, m, diarioCajon,
+            id => llamarApi(configuracion, "GET", `/cajon/${id}/recuperacion`),
+            (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/recuperacion`, datos))
+            .catch(e => log(`CashKeeper: recuperación pendiente: ${e.message}`)).finally(() => { m.recuperando = false; });
+        }
       }
       // Los cobros del cajón, cada uno por su lado (pueden tardar minutos): la impresión sigue mientras.
       for (const operacion of cajon) {
