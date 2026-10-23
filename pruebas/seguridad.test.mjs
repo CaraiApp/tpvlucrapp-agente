@@ -9,7 +9,8 @@ import { operarCkfast } from '../cashkeeper-ckfast.mjs';
 import { DiarioCashKeeper, niveles, inventario, recuperarCancelacionesVacias } from '../cashkeeper-seguro.mjs';
 
 class Maquina extends EventEmitter {
-  constructor(fallo = '') { super(); Object.assign(this, { fallo, estado: 1, credito: 0, metido: 0, salida: 0, ordenes: [], intervalo: 1, timeoutOperacion: 40, turno: Promise.resolve(), cambio: 10, recaudacion: 3, transferido: 0 }); }
+  // El fsync del diario en el runner Windows puede superar40ms; solo la prueba de timeout usa ese límite.
+  constructor(fallo = '') { super(); Object.assign(this, { fallo, estado: 1, credito: 0, metido: 0, salida: 0, ordenes: [], intervalo: 1, timeoutOperacion: fallo === 'sin-disabled' ? 40 : 2000, turno: Promise.resolve(), cambio: 10, recaudacion: 3, transferido: 0 }); }
   asegurar() { if (this.pausada && this.estado === 0) throw new Error("Desconectada"); if (this.estado === 0) this.estado = 1; if (this.fallo === 'antes') throw new Error('Timeout antes de enviar'); }
   mantenerViva() {}
   soltar() {}

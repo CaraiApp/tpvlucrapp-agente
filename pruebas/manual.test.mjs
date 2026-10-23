@@ -9,7 +9,7 @@ import { herramientaManual } from '../cashkeeper-configuracion.mjs';
 import { recuperarInterrupciones, validarRecuperacion } from '../cashkeeper-recuperacion.mjs';
 
 class Maquina extends EventEmitter {
-  constructor(p = null) { super(); this.interrumpida=p; this.credito=p && [2,7].includes(p.estado) ? p.valor : 0; this.ordenes=[]; this.props={}; this.intervalo=1; this.timeoutOperacion=25; this.max='20,10'; this.min='3'; }
+  constructor(p = null) { super(); this.interrumpida=p; this.credito=p && [2,7].includes(p.estado) ? p.valor : 0; this.ordenes=[]; this.props={}; this.intervalo=1; this.timeoutOperacion=2000; this.max='20,10'; this.min='3'; }
   asegurar() {} enTurno(fn) { return fn(); }
   async orden(c,p=[]) {
     this.antesDeEnviar?.(c); this.ordenes.push([c,...p]);
