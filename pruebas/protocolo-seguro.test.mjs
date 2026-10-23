@@ -23,6 +23,9 @@ async function escenario(t, fallo = '') {
         else if (c === '38') enviar('$38|1|EUR|#');
         else if (c === '40') enviar('$40|1|1#');
         else if (c === '43') enviar('$43|1|0#');
+        else if (c === '79') enviar('$79|1|100,50000|9,0|EUR#');
+        else if (c === '19') enviar(p[0] === '100' ? '$19|1|7#' : '$19|0|39|Value not supported.#');
+        else if (c === '17') enviar('$17|1|EUR|100|3#');
         else if (c === '29') {
           if (fallo === 'corte') { s.destroy(); continue; }
           if (fallo !== 'sin-ack') enviar('$29|1#');
@@ -41,13 +44,20 @@ async function escenario(t, fallo = '') {
   const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), 'ck-tcp-'));
   t.after(async () => { m.soltar(); for (const s of sockets) s.destroy(); await new Promise(r => server.close(r)); fs.rmSync(carpeta, { recursive: true, force: true }); });
   const diario = new DiarioCashKeeper(carpeta);
-  const op = { id: 'tcp', tipo: 'salida', importe_centimos: 500, host: '127.0.0.1', puerto };
+  const op = { id: 'tcp', tipo: fallo === 'niveles' ? 'mantenimiento' : 'salida', herramienta: fallo === 'niveles' ? {accion:'niveles'} : undefined, importe_centimos: 500, host: '127.0.0.1', puerto };
   let final;
   await operarDirecto(op, async (...r) => { final = r; }, { maquina: m, diario });
   return { final, ordenes, diario, op, m };
 }
 for (const fallo of ['', 'duplicada']) test(`TCP handshake fragmentado y evento terminal ${fallo || 'normal'}`, async t => {
   const r = await escenario(t, fallo); assert.equal(r.final[0], 'cobrada'); assert.equal(r.ordenes.filter(x => x[0] === 29).length, 1); assert.equal(r.diario.leer('tcp').final.resultado.fin.actual, 500);
+});
+test('TCP: error 39 en un valor vacío conserva niveles actuales de los recicladores admitidos', async t => {
+  const r = await escenario(t, 'niveles');
+  assert.equal(r.final[0], 'cobrada');
+  assert.deepEqual(r.final[2].cambio, [{valor:100,unidades:7,divisa:'EUR'}]);
+  assert.equal(r.diario.leer('tcp'), null);
+  assert.ok(!r.ordenes.some(x => [9,11,12,13,14,29,30,42,52,67].includes(x[0])));
 });
 for (const fallo of ['corte', 'sin-ack', 'sin-disabled', 'interrumpida']) test(`TCP ${fallo}: bloquea sin reenviar Pay ni Discard`, async t => {
   const r = await escenario(t, fallo); assert.equal(r.final[0], 'error'); assert.equal(r.final[2].conciliar, true);

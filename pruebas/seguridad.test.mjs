@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { operarDirecto } from '../tpvlucrapp-agente.mjs';
 import { operarCkfast } from '../cashkeeper-ckfast.mjs';
-import { DiarioCashKeeper, niveles } from '../cashkeeper-seguro.mjs';
+import { DiarioCashKeeper, niveles, inventario } from '../cashkeeper-seguro.mjs';
 
 class Maquina extends EventEmitter {
   constructor(fallo = '') { super(); Object.assign(this, { fallo, estado: 1, credito: 0, metido: 0, salida: 0, ordenes: [], intervalo: 1, timeoutOperacion: 40, turno: Promise.resolve(), cambio: 10, recaudacion: 3, transferido: 0 }); }
@@ -93,6 +93,38 @@ test('retirada sin confirmar conserva bloqueo, no inventa cancelación física',
 test('Dar cambio conserva importe y no crea movimiento contable', async t => { const e = entorno(t); const r = await ejecutar(op('cambio'), e, p => p?.fase === 'eligiendo' ? { seleccion: [{ valor: 100, unidades: 5 }] } : { terminar: true }); assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.introducido, r.progreso.devuelto); });
 test('Dar cambio parcial se detiene sin pagar el resto a ciegas', async t => { const e = entorno(t, 'parcial'); const r = await ejecutar(op('cambio'), e, p => p?.fase === 'eligiendo' ? { seleccion: [{ valor: 100, unidades: 5 }] } : { terminar: true }); assert.equal(r.resultado.conciliar, true); assert.equal(e.maquina.ordenes.filter(x => x[0] === 30).length, 1); assert.equal(r.progreso.devuelto, 400); assert.equal(r.resultado.fin.actual, 400); });
 test('niveles preservan divisas y rechazan datos malformados', () => { assert.equal(niveles('100,100', '3,2', 'EUR,USD')[1].divisa, 'USD'); assert.throws(() => niveles('1,2', '3', 'EUR')); assert.throws(() => niveles('1', 'NaN', 'EUR')); });
+test('niveles actuales aíslan un valor sin reciclador sin usar niveles antiguos ni mover dinero', async () => {
+  const ordenes = [];
+  const m = { async orden(c, p = []) {
+    ordenes.push([c, ...p]);
+    if (c === 38) return ['EUR'];
+    if (c === 79) return ['100,50000,100', '9,0,2', 'EUR,EUR,USD'];
+    if (c === 19 && p[0] === '100') return ['7'];
+    if (c === 19) throw Object.assign(new Error('Value not supported'), { codigo: 39 });
+    if (c === 17) return ['EUR', '100', '3'];
+    throw new Error('No se permite mover efectivo');
+  } };
+  const r = await inventario(m);
+  assert.deepEqual(r.cambio, [{valor:100,unidades:2,divisa:'USD'}, {valor:100,unidades:7,divisa:'EUR'}]);
+  assert.deepEqual(ordenes, [[38],[79,0],[19,'100,50000'],[19,'100'],[19,'50000'],[17]]);
+});
+for (const caso of ['nivel-no-cero', 'error-distinto', 'ninguna-admitida']) test(`consulta no oculta inventario incompleto: ${caso}`, async () => {
+  const m = { async orden(c) {
+    if (c === 38) return ['EUR'];
+    if (c === 79) return ['50000', caso === 'nivel-no-cero' ? '1' : '0', 'EUR'];
+    if (c === 19) throw Object.assign(new Error('Consulta rechazada'), { codigo: caso === 'error-distinto' ? 37 : 39 });
+    throw new Error('No debe continuar con recaudación');
+  } };
+  await assert.rejects(inventario(m), caso === 'ninguna-admitida' ? /ninguna denominación/ : /Consulta rechazada/);
+});
+test('fallo de lectura no crea un diario incierto ni envía pagos', async t => {
+  const e = entorno(t);
+  const original = e.maquina.orden.bind(e.maquina);
+  e.maquina.orden = async (c, p) => { if (c === 19) throw Object.assign(new Error('Value not supported'), {codigo:39}); return original(c,p); };
+  const r = await ejecutar(op('mantenimiento', {herramienta:{accion:'niveles'}}), e);
+  assert.equal(r.estado, 'error'); assert.equal(e.diario.leer('op-1'), null);
+  assert.ok(!e.maquina.ordenes.some(x => [9,11,12,13,14,29,30,42,52,67].includes(x[0])));
+});
 test('CKFast: respuesta C perdida, consulta mismo ticket y persiste el éxito', async t => { const e = entorno(t); const cmds = []; let final; await operarCkfast(op('cobro', { ticket: '1', orden: 'C|1|500' }), async (...x) => { final = x; }, { diario: e.diario, intervalo: 1, timeout: 10, orden: async x => { cmds.push(x); if (x[0] === 'C') throw new Error('corte'); return 'OK|OK'; } }); assert.deepEqual(cmds, ['C|1|500', 'S|1']); assert.equal(final[0], 'cobrada'); });
 test('CKFast: reinicio consulta S sin repetir C ni cambiar de método', async t => { const e = entorno(t); const o = op('cobro', { ticket: '1', orden: 'C|1|500' }); e.diario.iniciar(o); const cmds = []; let final; await operarCkfast({ ...o, reanudar: true }, async (...x) => { final = x; }, { diario: e.diario, intervalo: 1, timeout: 5, orden: async x => { cmds.push(x); return 'NOK|Not found'; } }); assert.deepEqual(cmds, ['S|1']); assert.equal(final[2].conciliar, true); });
 

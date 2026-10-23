@@ -40,7 +40,7 @@ import { fileURLToPath } from "node:url";
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -761,7 +761,7 @@ export class MaquinaDirecta extends EventEmitter {
         this.esperando = null;
         if (p[0] === "1") e.resolver(p.slice(1));
         else {
-          const error = new Error(p[2] ? `${p[2]} (error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
+          const error = new Error(p[2] ? `${p[2]} (orden ${codigo}, error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
           error.codigo = Number(p[1]);
           error.rechazoSeguro = codigo === "29" && [2, 4, 32, 36, 37].includes(error.codigo);
           e.rechazar(error);

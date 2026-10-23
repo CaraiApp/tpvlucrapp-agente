@@ -147,9 +147,27 @@ export async function inventario(m) {
   let cambio = niveles(v, n, d || principal);
   const principales = cambio.filter(x => x.divisa === principal).map(x => x.valor).join(',');
   if (principales) {
-    const [actuales] = await m.orden(19, [principales]);
-    const leidos = niveles(principales, actuales, principal);
-    cambio = cambio.map(x => x.divisa === principal ? leidos.find(y => y.valor === x.valor) : x);
+    let leidos;
+    try {
+      const [actuales] = await m.orden(19, [principales]);
+      leidos = niveles(principales, actuales, principal);
+    } catch (error) {
+      if (error.codigo !== 39) throw error;
+      // GetLastLevels puede incluir denominaciones sin reciclador (nivel cero).
+      // Un solo valor no admitido invalida la consulta conjunta: aislarlo leyendo,
+      // sin sustituir niveles actuales por la caché ni enviar órdenes de efectivo.
+      leidos = [];
+      for (const x of cambio.filter(x => x.divisa === principal)) {
+        try {
+          const [actual] = await m.orden(19, [String(x.valor)]);
+          leidos.push(...niveles(String(x.valor), actual, principal));
+        } catch (individual) {
+          if (individual.codigo !== 39 || x.unidades !== 0) throw individual;
+        }
+      }
+      if (!leidos.length) throw new Error('La máquina no admite la consulta de niveles actuales de ninguna denominación. No se ha movido dinero.');
+    }
+    cambio = [...cambio.filter(x => x.divisa !== principal), ...leidos];
   }
   const [cc, vc, nc] = await m.orden(17);
   return { divisa: principal, cambio, recaudacion: niveles(vc, nc, cc || principal) };
