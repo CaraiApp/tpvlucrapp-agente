@@ -201,8 +201,28 @@ export async function recuperarCancelacionesVacias(m, op, diario, consultar, con
 export async function inventario(m) {
   const [principal] = await m.orden(38);
   if (!/^[A-Z]{3}$/.test(principal)) throw new Error('Divisa principal no válida');
-  const [v, n, d] = await m.orden(79, [0]);
-  let cambio = niveles(v, n, d || principal);
+  let cambio = [];
+  try {
+    const [v, n, d] = await m.orden(79, [0]);
+    cambio = niveles(v, n, d || principal);
+  } catch (error) {
+    // GetLastLevels no existe en todos los modelos/configuraciones. Solo un rechazo
+    // explícito admite otra consulta; una desconexión o datos corruptos no son ceros.
+    if (![34, 38, 39].includes(error.codigo)) throw error;
+  }
+  if (!cambio.some(x => x.divisa === principal)) {
+    let valores;
+    try {
+      const [monedas, billetes] = await m.orden(78, [principal]);
+      valores = [monedas, billetes].filter(Boolean).join(',').split(',').map(x => entero(x));
+      if (!valores.length || valores.some(x => x <= 0) || new Set(valores).size !== valores.length) throw new Error('Denominaciones reconocidas no válidas');
+    } catch (error) {
+      if (![34, 38, 39].includes(error.codigo) || principal !== 'EUR') throw error;
+      valores = EURO;
+    }
+    // null = nivel desconocido, no cero: se deberá consultar19 antes de usarlo.
+    cambio.push(...valores.map(valor => ({valor, unidades: null, divisa: principal})));
+  }
   const principales = cambio.filter(x => x.divisa === principal).map(x => x.valor).join(',');
   if (principales) {
     let leidos;
@@ -220,7 +240,7 @@ export async function inventario(m) {
           const [actual] = await m.orden(19, [String(x.valor)]);
           leidos.push(...niveles(String(x.valor), actual, principal));
         } catch (individual) {
-          if (individual.codigo !== 39 || x.unidades !== 0) throw individual;
+          if (individual.codigo !== 39 || (x.unidades !== 0 && x.unidades !== null)) throw individual;
         }
       }
       if (!leidos.length) throw new Error('La máquina no admite la consulta de niveles actuales de ninguna denominación. No se ha movido dinero.');

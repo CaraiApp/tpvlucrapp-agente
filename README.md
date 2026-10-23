@@ -42,7 +42,7 @@ No mueve dinero ni toca lo que hace CKMonitor. En el cajón (oficina → Editar)
 su pantalla) y, si el instalador la cambió, la clave. Para comprobarlo: `tpvlucrapp-agente --leer-cashkeeper
 192.168.1.20 [CLAVE]`.
 
-## CashKeeper directo y recuperación (0.8.0)
+## CashKeeper directo y recuperación (0.8.1)
 
 La conexión directa utiliza Raw Sockets del manual de integración V3. Se controla desde **Caja → CashKeeper**:
 
@@ -52,6 +52,10 @@ La conexión directa utiliza Raw Sockets del manual de integración V3. Se contr
 - Aceptar o rechazar avisos de protección de cambio con autorización y plazo. Si nadie responde, se rechaza.
 - Recuperar una entrada o un pago interrumpido con evidencia de la máquina y del registro local. Un pago parcial se continúa solo por la diferencia. Una salida puede cerrarse con lo que realmente se entregó.
 - Elegir denominaciones en una salida respetando el límite antiatraco. Una función no soportada no se sustituye por otra que ignore el límite.
+
+Desde la 0.8.1, la lectura funciona también cuando la máquina rechaza `GetLastLevels` (orden 79). Se descubren las denominaciones con la orden 78 o, en EUR, se consultan sus valores individualmente con la 19 si es necesario. Las cantidades siempre se leen de la máquina; un fallo de conexión no se interpreta como inventario vacío. Office y la conexión directa comparten esta lectura.
+
+En **Ver monedas y billetes**, el TPV separa lo disponible para pagar de la recaudación. La salida manual muestra solo piezas disponibles, con botones + y − limitados a sus existencias. El agente comprueba las cantidades otra vez antes de ordenar el pago.
 
 Cancelar «Dar cambio» sin introducir dinero no crea un asiento de0€. Un corte o un resultado desconocido conserva la incidencia; no se repite la orden al reiniciar. Desconectar no borra crédito pendiente y no se permite durante una operación física activa.
 

@@ -41,8 +41,8 @@ import { fileURLToPath } from "node:url";
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
-import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.0";
+import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
+const VERSION = "0.8.1";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -506,87 +506,54 @@ const euros = (centimos) => `${(centimos / 100).toFixed(2).replace(".", ",")} �
 // CKMonitor. Los valores van en céntimos (un billete de 5 € es 500) y solo cuentan los euros (la máquina puede aceptar
 // otras divisas).
 
-const VALORES_EURO = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000];
-
-/** Cada valor con sus unidades, de dos listas separadas por comas (y, si viene, la divisa de cada uno). */
-function unidadesDe(valores = "", cantidades = "", divisas = "EUR") {
-  return niveles(valores, cantidades, divisas || "EUR");
-}
-
 const totalDe = (lista) => lista.filter(x => !x.divisa || x.divisa === "EUR").reduce((suma, { valor, unidades }) => suma + valor * unidades, 0);
 
-/** Lee lo que hay en la máquina: { divisa, cambio: [{valor, unidades}], recaudacion: [{valor, unidades}] }. */
+/** Office utiliza el mismo inventario actual que Host, sin Startup ni órdenes que cambien la máquina. */
 export function leerEfectivo(host, puerto, semilla, espera = 15000) {
   return new Promise((resolver, rechazar) => {
     const conexion = net.createConnection({ host, port: Number(puerto) || 8002 });
-    const resultado = { divisa: "EUR", cambio: [], recaudacion: [] };
-    let pendiente = "";
-    let claveMandada = false;
-    let dentro = false;
-    let acabado = false;
-    const acabar = (error) => {
+    let buffer = ''; let claveMandada = false; let dentro = false; let acabado = false; let pendiente;
+    const acabar = (error, resultado) => {
       if (acabado) return;
-      acabado = true;
-      clearTimeout(tiempo);
-      conexion.destroy();
-      if (error) rechazar(error);
+      acabado = true; clearTimeout(tiempo); conexion.destroy();
+      if (error) { pendiente?.rechazar(error); pendiente = null; rechazar(error); }
       else resolver(resultado);
     };
-    const tiempo = setTimeout(
-      () => acabar(new Error(dentro ? `La máquina no contesta a la consulta en ${host}:${puerto}` : `No se puede entrar en la consulta de la máquina en ${host}:${puerto}`)),
-      espera,
-    );
-    const mandar = (orden) => conexion.write(Buffer.from(orden, "ascii"));
-    const atender = (codigo, p) => {
-      if (codigo === "57" && !claveMandada) {
-        claveMandada = true;
-        const clave = Number(p[0]) + Number(semilla);
-        if (!Number.isSafeInteger(clave)) throw new Error("La máquina no ha dado el número para la clave de consulta");
-        return mandar(`$57|${clave}#`);
-      }
-      if (codigo === "58") {
-        dentro = true;
-        return mandar("$79|0#");
-      }
-      if (codigo === "79") {
-        if (p[0] !== "1") return mandar(`$19|${VALORES_EURO.join(",")}#`);
-        resultado.cambio = unidadesDe(p[1], p[2], p[3]);
-        return mandar("$17#");
-      }
-      if (codigo === "19") {
-        if (p[0] !== "1") throw new Error(`La máquina no deja leer lo que hay para dar cambio (${p.slice(1).join(" ")})`);
-        resultado.cambio = unidadesDe(VALORES_EURO.join(","), p[1]);
-        return mandar("$17#");
-      }
-      if (codigo === "17") {
-        if (p[0] !== "1") throw new Error(`La máquina no deja leer el cajón de recaudación (${p.slice(1).join(" ")})`);
-        resultado.recaudacion = unidadesDe(p[2], p[3], p[1] || "EUR");
-        return acabar(null);
-      }
-      // Lo demás (eventos como «$106|2#», cambios de estado): no se pide, no se usa.
-    };
-    conexion.setEncoding("latin1");
-    conexion.on("connect", () => mandar("$47#"));
-    conexion.on("data", (trozo) => {
-      pendiente += trozo;
-      for (let fin = pendiente.indexOf("#"); fin >= 0; fin = pendiente.indexOf("#")) {
-        const mensaje = pendiente.slice(0, fin);
-        pendiente = pendiente.slice(fin + 1);
-        const inicio = mensaje.indexOf("$");
-        if (inicio < 0) continue;
-        const partes = mensaje.slice(inicio + 1).split("|").map((x) => x.trim());
-        try {
-          atender(partes[0], partes.slice(1));
-        } catch (error) {
-          return acabar(error);
+    const tiempo = setTimeout(() => acabar(new Error(dentro ? 'La máquina no contesta a la consulta de efectivo' : 'No se puede entrar en la consulta de la máquina')), espera);
+    const mandar = texto => conexion.write(Buffer.from(texto, 'ascii'));
+    const orden = (codigo, parametros = []) => new Promise((resolve, reject) => {
+      if (acabado) return reject(new Error('La consulta se ha cerrado'));
+      if (pendiente) return reject(new Error('Hay una consulta en curso'));
+      if (![17,19,38,78,79].includes(codigo)) return reject(new Error('Orden no permitida en lectura Office'));
+      pendiente = { codigo, resolver: resolve, rechazar: reject };
+      mandar(`$${codigo}${parametros.length ? '|' + parametros.join('|') : ''}#`);
+    });
+    conexion.setEncoding('latin1');
+    conexion.on('connect', () => mandar('$47#'));
+    conexion.on('data', trozo => {
+      buffer += trozo;
+      if (buffer.length > 262144) return acabar(new Error('Respuesta de inventario demasiado grande'));
+      for (let fin = buffer.indexOf('#'); fin >= 0 && !acabado; fin = buffer.indexOf('#')) {
+        const texto = buffer.slice(0, fin); buffer = buffer.slice(fin + 1);
+        const inicio = texto.indexOf('$'); if (inicio < 0) continue;
+        const [c, ...p] = texto.slice(inicio + 1).split('|').map(x => x.trim());
+        if (c === '57' && !claveMandada) {
+          claveMandada = true; const clave = Number(p[0]) + Number(semilla);
+          if (!Number.isSafeInteger(clave)) return acabar(new Error('Clave de consulta no válida'));
+          mandar(`$57|${clave}#`);
+        } else if (c === '58' && !dentro) {
+          dentro = true;
+          void inventario({orden}).then(r => acabar(null, r), acabar);
+        } else if (pendiente && Number(c) === pendiente.codigo) {
+          const peticion = pendiente; pendiente = null;
+          if (p[0] === '1') peticion.resolver(p.slice(1));
+          else peticion.rechazar(Object.assign(new Error(`No se pudo consultar el efectivo (orden ${c}, error ${p[1]}): ${p[2] ?? ''}`), {codigo:Number(p[1])}));
         }
       }
     });
-    // Con la clave mala, la máquina cierra la conexión sin decir nada.
-    conexion.on("end", () =>
-      acabar(new Error(dentro ? "La máquina cortó la consulta" : "La máquina no acepta la clave de consulta (de serie 100001): revísala en la oficina")),
-    );
-    conexion.on("error", (error) => acabar(error));
+    conexion.on('end', () => acabar(new Error(dentro ? 'La máquina cortó la consulta' : 'La máquina no acepta la clave de consulta: revísala en la oficina')));
+    conexion.on('error', acabar);
+    conexion.on('close', () => { if (!acabado) acabar(new Error('Se cerró la consulta de efectivo')); });
   });
 }
 // Conexión directa con el CashKeeper, sin CKMonitor (desde la 0.6.0) ---------------------------------------------------

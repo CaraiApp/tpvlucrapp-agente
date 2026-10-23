@@ -71,15 +71,17 @@ for (const mala of [false,true]) test(`Office consulta sin Startup ni dinero, cl
   const srv=net.createServer(s=>{ss.add(s);s.on('close',()=>ss.delete(s));s.on('data',b=>{const c=b.toString();cmds.push(c);
     if(c==='$47#')s.write('$57|123#');
     else if(c.startsWith('$57|')){if(mala)s.end();else s.write('$58|TEST#');}
+    else if(c==='$38#')s.write('$38|1|EUR|USD#');
     else if(c==='$79|0#')s.write('$106|1|0#$79|1|100,100|3,2|EUR,USD#');
+    else if(c==='$19|100#')s.write('$19|1|1#');
     else if(c==='$17#')s.write('$17|1|EUR|500|2#');
     else throw new Error('Office no admite '+c);
   });});
   srv.listen(0,'127.0.0.1');await new Promise(r=>srv.once('listening',r));
   t.after(async()=>{for(const s of ss)s.destroy();await new Promise(r=>srv.close(r));});
   const p=leerEfectivo('127.0.0.1',srv.address().port,mala?'1':'100001',500);
-  if(mala)await assert.rejects(p,/clave/);else {const r=await p;assert.equal(r.cambio[1].divisa,'USD');assert.equal(r.recaudacion[0].unidades,2);}
-  assert.ok(cmds.every(x=>/^\$(47|57|79|17)[|#]/.test(x)));
+  if(mala)await assert.rejects(p,/clave/);else {const r=await p;assert.equal(r.cambio.find(x=>x.divisa==='USD').unidades,2);assert.equal(r.cambio.find(x=>x.divisa==='EUR').unidades,1);assert.equal(r.recaudacion[0].unidades,2);}
+  assert.ok(cmds.every(x=>/^\$(47|57|38|79|19|17)[|#]/.test(x)));
 });
 
 for (const caso of ['aceptar','caducar','error']) test(`TCP eventos manual: ${caso}`, async t => {
@@ -101,4 +103,11 @@ for (const caso of ['aceptar','caducar','error']) test(`TCP eventos manual: ${ca
   if(caso==='aceptar'){await m.responderPregunta(p.id,true);await m.responderPregunta(p.id,true);assert.equal(ordenes.filter(x=>x===3).length,1);assert.equal(m.observaciones().pregunta,null);}
   else {await new Promise(r=>setTimeout(r,110));assert.equal(ordenes.filter(x=>x===32).length,1);assert.ok(!ordenes.includes(3));}
   cliente.write('$113|0#');await new Promise(r=>setTimeout(r,10));assert.equal(m.observaciones().billete_pendiente,false);
+});
+
+test('Office real TCP: 79 y78 rechazadas, cantidades actuales19 por valor y recaudación separada',async t=>{
+ const cmds=[];const sockets=new Set();const srv=net.createServer(s=>{sockets.add(s);s.on('error',()=>{});let b='';s.on('data',d=>{b+=d;while(b.includes('#')){const i=b.indexOf('#');const [c,...p]=b.slice(1,i).split('|');b=b.slice(i+1);cmds.push(Number(c));
+ if(c==='47')s.write('$57|123#');else if(c==='57')s.write('$58|TEST#');else if(c==='38')s.write('$38|1|EUR|#');else if(['79','78'].includes(c))s.write(`$${c}|0|39|Value not supported.#`);else if(c==='19')s.write(p[0]==='100'?'$19|1|4#':p[0]==='200'?'$19|1|0#':'$19|0|39|Value not supported.#');else if(c==='17')s.write('$17|1|EUR|200|6#');else throw new Error(`Orden física inesperada ${c}`);
+ } });});await new Promise(r=>srv.listen(0,'127.0.0.1',r));t.after(async()=>{for(const s of sockets)s.destroy();await new Promise(r=>srv.close(r));});
+ const r=await leerEfectivo('127.0.0.1',srv.address().port,'100001',2000);assert.deepEqual(r.cambio,[{valor:100,unidades:4,divisa:'EUR'},{valor:200,unidades:0,divisa:'EUR'}]);assert.equal(r.recaudacion[0].unidades,6);assert.ok(cmds.every(x=>[47,57,38,79,78,19,17].includes(x)));
 });

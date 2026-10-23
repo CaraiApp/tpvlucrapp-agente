@@ -295,8 +295,10 @@ export function crearCashKeeper(opciones = {}) {
     return `$17|1|EUR|${DENOMINACIONES.join(",")}|${DENOMINACIONES.map((v) => m.recaudacion[v]).join(",")}#`;
   }
 
-  function atenderConsulta(socket, codigo) {
+  function atenderConsulta(socket, codigo, p) {
     const responder = (texto) => mandar(socket, texto);
+    if (codigo === "38") return responder("$38|1|EUR|#");
+    if (codigo === "19") return responder(`$19|1|${p[0].split(",").map(v=>m.cambio[Number(v)] ?? 0).join(",")}#`);
     if (codigo === "79" || codigo === "17") return responder(niveles(codigo));
     return responder(`$${codigo}|0|42|Orden no esperada#`);
   }
@@ -328,7 +330,7 @@ export function crearCashKeeper(opciones = {}) {
             }
             if (!dentro) return socket.destroy();
             if (esControl) atenderControl(socket, codigo, p);
-            else atenderConsulta(socket, codigo);
+            else atenderConsulta(socket, codigo, p);
           }
         });
         socket.on("close", () => {

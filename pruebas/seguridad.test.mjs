@@ -227,3 +227,20 @@ test('desconectar tras un reinicio conserva el diario sin finalizar y no descart
  const e=entorno(t);e.diario.iniciar(op('salida'));const antes=e.diario.leer('op-1');
  const r=await ejecutar(op('mantenimiento',{id:'desconectar',herramienta:{accion:'desconectar',confirmado:true}}),e);assert.equal(r.estado,'cobrada');assert.deepEqual(e.diario.leer('op-1'),antes);assert.ok(!e.maquina.ordenes.some(x=>[29,52,68].includes(x[0])));
 });
+
+for(const listaAdmitida of [true,false]) test(`inventario sin orden79: descubre denominaciones ${listaAdmitida?'con78':'con lectura individual EUR'}`,async()=>{
+ const ordenes=[];
+ const m={orden:async(c,p=[])=>{ordenes.push([c,...p]);if(c===38)return ['EUR',''];if(c===79 || (c===78&&!listaAdmitida))throw Object.assign(new Error('No admitida'),{codigo:39});if(c===78)return ['100,200','500'];if(c===19){if(p[0]==='100')return ['3'];if(p[0]==='200')return ['0'];if(p[0]==='500')return ['2'];throw Object.assign(new Error('No admitida'),{codigo:39});}if(c===17)return ['EUR','200,5000','6,1'];throw new Error('No se permite dinero');}};
+ const r=await inventario(m);assert.deepEqual(r.cambio,[{valor:100,unidades:3,divisa:'EUR'},{valor:200,unidades:0,divisa:'EUR'},{valor:500,unidades:2,divisa:'EUR'}]);assert.equal(r.recaudacion[0].unidades,6);
+ assert.ok(ordenes.every(x=>[38,79,78,19,17].includes(x[0])));
+});
+for(const fallo of ['red','datos','otra-divisa']) test(`inventario incompatible no inventa efectivo: ${fallo}`,async()=>{
+ const ordenes=[];const m={orden:async(c)=>{ordenes.push(c);if(c===38)return [fallo==='otra-divisa'?'GBP':'EUR'];if(c===79){if(fallo==='red')throw new Error('Sin red');if(fallo==='datos')return ['100,200','5','EUR'];}throw Object.assign(new Error('No admitida'),{codigo:39});}};
+ await assert.rejects(inventario(m));assert.ok(!ordenes.includes(19));
+});
+test('salida específica sin existencias con orden79 no admitida: no paga ni crea conciliación',async t=>{
+ const e=entorno(t);const original=e.maquina.orden.bind(e.maquina);
+ e.maquina.orden=async(c,p=[])=>{if(c===79)throw Object.assign(new Error('No admitida'),{codigo:39});return original(c,p);};
+ const r=await ejecutar(op('salida',{importe_centimos:200,seleccion:[{valor:200,unidades:1}]}),e);
+ assert.equal(r.estado,'error');assert.equal(r.resultado.conciliar,false);assert.ok(!e.maquina.ordenes.some(x=>[29,30,87].includes(x[0])));
+});
