@@ -23,6 +23,8 @@ Y le cuenta a la oficina qué impresoras tiene el ordenador, para darlas de alta
 - Windows avisa «Windows protegió tu PC» la primera vez: **Más información → Ejecutar de todas formas** (el programa aún no va firmado).
 - Mac avisa de que no puede comprobarlo: clic derecho → **Abrir**, o Ajustes del Sistema → **Privacidad y seguridad** → «Abrir de todos modos».
 
+**Actualizar en Windows (0.8.3):** termina cualquier cobro o devolución en curso y abre la nueva descarga. Cuando indique que el ordenador ya está conectado, pulsa Enter sin escribir otro código. El instalador prepara la nueva copia, pausa el arranque automático, cierra únicamente el ejecutable instalado y espera a que termine antes de sustituirlo. Reintenta brevemente si Windows sigue bloqueando el archivo. Conserva el enlace, la pausa de CashKeeper y su diario; no hace falta desinstalar. Si no puede sustituirlo, conserva el binario anterior y restaura la tarea previa. El error `EBUSY` de versiones anteriores indicaba que el ejecutable seguía ocupado.
+
 ## Cajón automático (CashKeeper)
 
 Desde la 0.4.0, si el local tiene un **CashKeeper**, el programa del ordenador donde está **CKMonitor** le pasa los

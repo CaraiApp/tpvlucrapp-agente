@@ -39,10 +39,11 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
+import { actualizarWindows, detenerEjecutableWindows } from './instalacion-windows.mjs';
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.2";
+const VERSION = "0.8.3";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -405,8 +406,7 @@ const plistRuta = () => path.join(os.homedir(), "Library", "LaunchAgents", `${ET
 async function pararEnSegundoPlano() {
   if (SISTEMA === "windows") {
     await ejecutar("schtasks", ["/End", "/TN", NOMBRE_TAREA]).catch(() => {});
-    await ejecutar("taskkill", ["/F", "/FI", "IMAGENAME eq tpvlucrapp-agente.exe", "/FI", `PID ne ${process.pid}`]).catch(() => {});
-    await dormir(1500);
+    await detenerEjecutableWindows(ejecutar, INSTALADO);
   } else if (SISTEMA === "mac") {
     await ejecutar("launchctl", ["bootout", `gui/${process.getuid()}/${ETIQUETA_MAC}`]).catch(() => {});
   }
@@ -414,24 +414,26 @@ async function pararEnSegundoPlano() {
 
 /** Copia el programa a su sitio y lo deja arrancando solo con el ordenador (y en marcha ya). */
 async function instalar() {
+  if (SISTEMA === "windows") {
+    return actualizarWindows({ origen: process.execPath, destino: INSTALADO, nombreTarea: NOMBRE_TAREA, ejecutar, parar: pararEnSegundoPlano, registrar: async () => {
+      try {
+        await compilarAyudante(path.join(path.dirname(INSTALADO), "rawprint.exe"));
+      } catch (error) {
+        log(`Aviso: la impresión por las impresoras de Windows se preparará al imprimir (${error.message})`);
+      }
+      const xml = path.join(os.tmpdir(), `tpvlucrapp-tarea-${process.pid}.xml`);
+      fs.writeFileSync(xml, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(tareaWindows(INSTALADO), "utf16le")]));
+      try {
+        await ejecutar("schtasks", ["/Create", "/TN", NOMBRE_TAREA, "/XML", xml, "/F"]);
+      } finally {
+        fs.unlinkSync(xml);
+      }
+    } });
+  }
   await pararEnSegundoPlano();
   fs.mkdirSync(path.dirname(INSTALADO), { recursive: true });
   if (path.resolve(process.execPath).toLowerCase() !== path.resolve(INSTALADO).toLowerCase()) fs.copyFileSync(process.execPath, INSTALADO);
-  if (SISTEMA === "windows") {
-    try {
-      await compilarAyudante(path.join(path.dirname(INSTALADO), "rawprint.exe"));
-    } catch (error) {
-      log(`Aviso: la impresión por las impresoras de Windows se preparará al imprimir (${error.message})`);
-    }
-    const xml = path.join(os.tmpdir(), `tpvlucrapp-tarea-${process.pid}.xml`);
-    fs.writeFileSync(xml, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(tareaWindows(INSTALADO), "utf16le")]));
-    try {
-      await ejecutar("schtasks", ["/Create", "/TN", NOMBRE_TAREA, "/XML", xml, "/F"]);
-    } finally {
-      fs.unlinkSync(xml);
-    }
-    await ejecutar("schtasks", ["/Run", "/TN", NOMBRE_TAREA]);
-  } else if (SISTEMA === "mac") {
+  if (SISTEMA === "mac") {
     fs.chmodSync(INSTALADO, 0o755);
     await ejecutar("xattr", ["-d", "com.apple.quarantine", INSTALADO]).catch(() => {});
     fs.mkdirSync(path.dirname(plistRuta()), { recursive: true });

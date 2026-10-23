@@ -24,7 +24,7 @@ jobs:
         with:
           bun-version: latest
       - name: Seguridad monetaria simulada
-        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs pruebas/manual.test.mjs
+        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs pruebas/manual.test.mjs pruebas/instalacion.test.mjs
       - name: Compilar
         run: bun build ./tpvlucrapp-agente.mjs --compile --target=bun-windows-x64 --outfile tpvlucrapp-agente-windows.exe
       - name: Cobra en el CashKeeper (plataforma y CKMonitor de mentira)
@@ -53,6 +53,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "no se creó la tarea de arranque" }
           if (-not (Test-Path "C:\Program Files\TPV Lucrapp\tpvlucrapp-agente.exe")) { throw "falta el programa instalado" }
           if (-not (Test-Path "C:\Program Files\TPV Lucrapp\rawprint.exe")) { throw "falta el ayudante de impresión" }
+      - name: Actualizar con el programa en marcha sin perder datos
+        shell: pwsh
+        run: ./pruebas/actualizar-windows.ps1
       - name: Imprimir tal cual en la impresora de Windows
         run: .\tpvlucrapp-agente-windows.exe --probar-impresora "Ticket de prueba"
       - name: Llegaron los bytes ESC/POS
@@ -87,7 +90,7 @@ jobs:
         with:
           bun-version: latest
       - name: Seguridad monetaria simulada
-        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs pruebas/manual.test.mjs
+        run: node --test pruebas/seguridad.test.mjs pruebas/protocolo-seguro.test.mjs pruebas/manual.test.mjs pruebas/instalacion.test.mjs
       - name: Compilar (chip Apple e Intel)
         run: |
           bun build ./tpvlucrapp-agente.mjs --compile --target=bun-darwin-arm64 --outfile apple/tpvlucrapp-agente
