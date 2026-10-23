@@ -3,6 +3,18 @@ import { entero, hastaDisabled, limpiarCreditoConfirmado, revision } from './cas
 
 export function validarRecuperacion(anterior, pedido, interrumpida) {
   const p = pedido.interrumpida;
+  if (pedido.origen === 'cobro_con_vuelta') {
+    const f=anterior.final?.resultado?.fin, a=anterior.final?.progreso;
+    const objetivo=anterior.objetivo+(anterior.propina ?? 0);
+    if (!pedido.id || pedido.accion!=='confirmar_cobro' || interrumpida || anterior.tipo!=='cobro' || anterior.comando!==42 || objetivo<=0 ||
+      anterior.final?.estado!=='error' || anterior.final?.error!=='El efectivo recibido y la devolución no cuadran' || !anterior.final?.resultado?.conciliar ||
+      !f || f.estado!==3 || f.error!==0 || f.operacion!==0 || f.actual<=0 || f.objetivo!==f.actual ||
+      a?.introducido!==f.actual || a.devuelto!==f.actual || a.objetivo!==objetivo ||
+      !p || p.estado!==3 || p.valor!==f.actual || p.objetivo!==f.actual || p.operacion!==0 ||
+      pedido.introducido_confirmado!==objetivo+f.actual)
+      throw revision('La confirmación del cobro no coincide con el diario y la vuelta entregada');
+    return { entrada:false, cobroConVuelta:true, objetivo, introducido:pedido.introducido_confirmado, restante:0, estado:'cobrada' };
+  }
   if (pedido.origen === 'cambio_sin_pago') {
     const f = anterior.final?.resultado?.fin; const a = anterior.final?.progreso;
     if (!pedido.id || pedido.accion !== 'devolver_cambio' || interrumpida || anterior.tipo !== 'cambio' ||
@@ -63,7 +75,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
           const plan = validarRecuperacion(local, pedido, m.interrumpida);
           const [estado] = await m.orden(40); const [divisa] = await m.orden(38);
           if (entero(estado, 7) !== 1 || divisa !== 'EUR' || m.eventoInesperado) throw revision('La máquina no está preparada para recuperar esta operación');
-          if (pedido.origen === 'terminal') {
+          if (pedido.origen === 'terminal' || plan.cobroConVuelta) {
             const [salida] = await m.orden(44); const [credito] = await m.orden(43,[255]);
             if (entero(salida) !== pedido.interrumpida.valor || entero(credito) !== 0) throw revision('El último pago o el crédito ha cambiado; no se puede recuperar con esta evidencia');
           }
@@ -78,7 +90,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
               enviado = true; local = { ...local, recuperacion: { ...local.recuperacion, comando: codigo, enviado: true } }; diario.guardar(anterior.id, local);
             }
           };
-          const progreso = { fase: plan.entrada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.entrada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago ? 0 : pedido.interrumpida.valor };
+          const progreso = { fase: plan.entrada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.cobroConVuelta ? plan.introducido : plan.entrada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago ? 0 : pedido.interrumpida.valor };
           const contar = async () => {
             const r = await informar(anterior.id, { recuperacion_id: pedido.id, estado: 'en_curso', progreso, ...(m.observaciones?.() ?? {}) });
             if (r?.decision && m.responderPregunta) await m.responderPregunta(r.decision.id, r.decision.aceptar === true);
@@ -89,7 +101,10 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
           let fin;
           try {
             await contar();
-            if (pedido.accion === 'cerrar_pago') {
+            if (plan.cobroConVuelta) {
+              // Conciliación confirmada por el responsable: solo lecturas, nunca cobrar, pagar ni borrar crédito.
+              fin=local.final.resultado.fin;
+            } else if (pedido.accion === 'cerrar_pago') {
               await m.orden(68); // No paga; cierra la parte que el responsable decidió no continuar.
             } else {
               fin = await hastaDisabled(m, () => plan.entrada ? m.orden(42, [plan.objetivo, 1]) : m.orden(29, [plan.restante, 0]), contar);
@@ -109,7 +124,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
           const [finalEstado] = await m.orden(40); const [credito] = await m.orden(43, [255]);
           if (entero(finalEstado, 7) !== 1 || entero(credito) !== 0) throw revision('Quedó crédito o actividad después de recuperar');
           progreso.fase = plan.estado === 'cancelada' ? 'cancelado' : 'hecho';
-          const final = { estado: plan.estado, progreso, resultado: { fin, recuperacion: { origen:pedido.origen ?? "interrupcion", interrumpida: pedido.interrumpida, accion: pedido.accion, estado: 1, credito: 0 }, conciliar: false } };
+          const final = { estado: plan.estado, progreso, resultado: { fin, recuperacion: { origen:pedido.origen ?? "interrupcion", interrumpida: pedido.interrumpida, accion: pedido.accion, ...(plan.cobroConVuelta ? {introducido_confirmado:plan.introducido} : {}), estado: 1, credito: 0 }, conciliar: false } };
           const nuevo = { ...local, final, recuperacion: { ...local.recuperacion, final, terminada_en: new Date().toISOString() } };
           diario.guardar(anterior.id, nuevo); m.interrumpida = null;
           if ((await informar(anterior.id, { recuperacion_id: pedido.id, ...final }))?.resuelta) diario.guardar(anterior.id, { ...nuevo, recuperacion: { ...nuevo.recuperacion, sincronizada: true } });

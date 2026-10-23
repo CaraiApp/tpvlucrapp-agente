@@ -256,3 +256,37 @@ test('error40 explícito permite descubrir valores y leer individualmente, sin o
  const ordenes=[];const m={orden:async(c,p=[])=>{ordenes.push(c);if(c===38)return ['EUR'];if([79,78].includes(c)||c===19&&p[0].includes(','))throw Object.assign(new Error('Not supported values'),{codigo:40});if(c===19){if(p[0]==='100')return ['2'];throw Object.assign(new Error('No admitido'),{codigo:39});}if(c===17)return ['EUR','',''];throw new Error('Orden física inesperada');}};
  assert.deepEqual((await inventario(m)).cambio,[{valor:100,unidades:2,divisa:'EUR'}]);assert.ok(ordenes.every(c=>[38,79,78,19,17].includes(c)));
 });
+
+// Traza real: cobro3,20, entrada5, vuelta1,80; Disabled termina PAYING y ValueIN queda0.
+function cobroConVuelta(e, fallo='') {
+  const original=e.maquina.orden.bind(e.maquina);
+  e.maquina.orden=async(c,p=[])=>{
+    if(c!==42)return original(c,p);
+    e.maquina.antesDeEnviar?.(c);e.maquina.ordenes.push([c,...p]);
+    e.maquina.credito=fallo==='credito'?700:0;e.maquina.salida=180;
+    if(fallo!=='sin-entrada')e.maquina.emit('107',['500',String(p[0]),fallo==='otra-operacion'?'1':'0']);
+    e.maquina.emit('108',['180','180','0']);
+    e.maquina.fin(180,fallo==='objetivo'?200:180,3);return [];
+  };
+}
+test('cobro3,20 con5 recibidos y1,80 de vuelta usa Disabled PAYING sin confundir entrada',async t=>{
+ const e=entorno(t);cobroConVuelta(e);const f=await ejecutar(op('cobro',{importe_centimos:320}),e);
+ assert.equal(f.estado,'cobrada');assert.equal(f.progreso.introducido,500);assert.equal(f.progreso.devuelto,180);
+ assert.deepEqual(f.resultado.entrada,{valor:500,operacion:0,fuente:'evento107'});
+ assert.equal(f.resultado.fin.actual,180);assert.equal(e.maquina.ordenes.filter(x=>x[0]===42).length,1);
+});
+for(const fallo of ['sin-entrada','otra-operacion','credito','objetivo'])test(`vuelta no confirma cobro con evidencia incorrecta: ${fallo}`,async t=>{
+ const e=entorno(t);cobroConVuelta(e,fallo);const f=await ejecutar(op('cobro',{importe_centimos:320}),e);
+ assert.equal(f.estado,'error');assert.equal(f.resultado.conciliar,true);assert.ok(!e.maquina.ordenes.some(x=>x[0]===52));
+});
+
+test('cobro exacto no atribuye la vuelta antigua de1,80 a la operación actual',async t=>{
+ const e=entorno(t),original=e.maquina.orden.bind(e.maquina);e.maquina.salida=180;
+ e.maquina.orden=async(c,p=[])=>{if(c!==42)return original(c,p);e.maquina.antesDeEnviar?.(c);e.maquina.ordenes.push([c,...p]);e.maquina.emit('107',['320','320','0']);e.maquina.fin(320,320,2);return [];};
+ const f=await ejecutar(op('cobro',{importe_centimos:320}),e);assert.equal(f.estado,'cobrada');assert.equal(f.progreso.devuelto,0);assert.ok(!e.maquina.ordenes.some(x=>x[0]===44));
+});
+test('cancelación con dinero termina PAYING y confirma devolución íntegra, sin cobrar',async t=>{
+ const e=entorno(t),original=e.maquina.orden.bind(e.maquina);
+ e.maquina.orden=async(c,p=[])=>{if(c!==9)return original(c,p);e.maquina.antesDeEnviar?.(c);e.maquina.ordenes.push([c,...p]);e.maquina.credito=0;e.maquina.salida=500;e.maquina.emit('108',['500','500','0']);e.maquina.fin(500,500,3);return [];};
+ const f=await ejecutar(op('entrada',{importe_centimos:0}),e,()=>({cancelar:true}));assert.equal(f.estado,'cancelada');assert.equal(f.progreso.introducido,500);assert.equal(f.progreso.devuelto,500);
+});

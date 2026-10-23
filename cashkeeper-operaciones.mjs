@@ -21,10 +21,11 @@ export async function operarEnMaquina(m, op, avisar) {
   }
   let accion = null;
   const observado = { introducido: 0, devuelto: 0 };
+  let eventoAjeno = false;
   const limite = Date.now() + 20 * 60_000;
   const contar = () => avisar('en_curso', null, null, { ...progreso });
-  const meter = p => { progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
-  const sacar = p => { progreso.devuelto = entero(p[0]); observado.devuelto = Math.max(observado.devuelto, progreso.devuelto); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
+  const meter = p => { if (p.length!==3 || p[2]!=='0' || (Number(p[1])!==objetivo && !(op.tipo==='entrada' && Number(p[1])===0))) { eventoAjeno=true; return; } progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
+  const sacar = p => { if (p.length!==3 || p[2]!=='0') { eventoAjeno=true; return; } progreso.devuelto = entero(p[0]); observado.devuelto = Math.max(observado.devuelto, progreso.devuelto); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
   m.on('107', meter); m.on('108', sacar);
   try {
     await contar();
@@ -49,8 +50,21 @@ export async function operarEnMaquina(m, op, avisar) {
       }
     });
     if (fin.cortada) throw revision('Se perdió la conexión durante el movimiento. Resultado incierto; no repetir.');
+    if (eventoAjeno) throw revision('Se recibieron importes de otra operación');
+    let entrada;
     if (saca) progreso.devuelto = fin.actual;
-    else progreso.introducido = fin.actual;
+    else if (fin.estado === 3) {
+      // Disabled PAYING describe la vuelta, no el dinero introducido (§9.2.3).
+      const credito = entero((await m.orden(43, [fin.operacion]))[0]);
+      const recibido = observado.introducido || credito;
+      if (!recibido || (credito > 0 && credito !== recibido) || observado.devuelto > fin.actual)
+        throw revision('No se puede confirmar el dinero introducido para esta vuelta');
+      progreso.introducido = recibido; progreso.devuelto = fin.actual;
+      entrada = { valor: recibido, operacion: fin.operacion, fuente: observado.introducido ? 'evento107' : 'valuein43' };
+    } else {
+      if (![2, 7].includes(fin.estado) || observado.introducido > fin.actual) throw revision('El final no corresponde a la entrada de efectivo');
+      progreso.introducido = fin.actual;
+    }
     await contar().catch(() => {});
     await comprobarFin(m, fin);
     if (saca) {
@@ -64,14 +78,16 @@ export async function operarEnMaquina(m, op, avisar) {
       progreso.objetivo = fin.actual;
       await limpiarCreditoConfirmado(m, fin.operacion);
     } else {
-      const [salida] = await m.orden(44); progreso.devuelto = entero(salida);
-      const esperado = accion === 'cancelar' ? fin.actual : fin.actual - objetivo;
-      if (esperado < 0 || progreso.devuelto !== esperado || (accion !== 'cancelar' && fin.objetivo !== objetivo)) throw revision('El efectivo recibido y la devolución no cuadran');
+      const esperado = accion === 'cancelar' ? progreso.introducido : progreso.introducido - objetivo;
+      // ValueOUT conserva el último pago: un cobro exacto no tiene vuelta que consultar.
+      progreso.devuelto = esperado === 0 && fin.estado !== 3 && observado.devuelto === 0 ? 0 : entero((await m.orden(44))[0]);
+      const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo;
+      if (esperado < 0 || progreso.devuelto !== esperado || !terminalCoherente) throw revision('El efectivo recibido y la devolución no cuadran');
       await limpiarCreditoConfirmado(m, fin.operacion);
     }
     const cancelada = accion === 'cancelar' || (abierta && fin.actual === 0);
     progreso.fase = cancelada ? 'cancelado' : 'hecho';
-    return avisar(cancelada ? 'cancelada' : 'cobrada', null, { ...progreso, fin }, { ...progreso });
+    return avisar(cancelada ? 'cancelada' : 'cobrada', null, { ...progreso, fin, ...(entrada ? { entrada } : {}) }, { ...progreso });
   } finally { m.off('107', meter); m.off('108', sacar); }
 }
 

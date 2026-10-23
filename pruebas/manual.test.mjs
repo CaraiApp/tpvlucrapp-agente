@@ -133,3 +133,29 @@ for(const caso of ['corte','parcial','ack-perdido']) test(`cambio sin pago no du
  for(let n=0;n<2;n++)await recuperarInterrupciones(e.maquina,e.op,e.diario,async()=>e.pedido,informar);
  assert.equal(e.maquina.ordenes.filter(x=>x[0]===29).length,1);assert.equal(e.diario.leer(e.op.id).final.resultado.conciliar,caso!=='ack-perdido');
 });
+
+function cobroAntiguo(t) {
+ const p={estado:3,valor:180,objetivo:180,operacion:0};
+ const e=contexto(t,'cobro',p,'confirmar_cobro',{comando:42});
+ const x=e.diario.leer(e.op.id);x.objetivo=320;e.diario.guardar(e.op.id,x);
+ e.pedido.origen='cobro_con_vuelta';e.pedido.introducido_confirmado=500;e.maquina.interrumpida=null;e.maquina.credito=0;e.maquina.salida=180;
+ e.diario.terminar(e.op.id,{estado:'error',error:'El efectivo recibido y la devolución no cuadran',progreso:{fase:'devolviendo',introducido:180,devuelto:180,objetivo:320},resultado:{conciliar:true,fin:{error:0,texto:'',actual:180,objetivo:180,estado:3,operacion:0}}});
+ return e;
+}
+test('confirmar cobro con vuelta no mueve dinero ni borra crédito; ACK perdido solo resincroniza',async t=>{
+ const e=cobroAntiguo(t);let fallo=true;
+ const informar=async(id,d)=>{if(d.estado==='cobrada'&&fallo){fallo=false;throw new Error('ACK perdido');}return {resuelta:d.estado==='cobrada'};};
+ for(let n=0;n<2;n++)await recuperarInterrupciones(e.maquina,e.op,e.diario,async()=>e.pedido,informar);
+ const x=e.diario.leer(e.op.id);assert.equal(x.final.estado,'cobrada');assert.equal(x.final.progreso.introducido,500);assert.equal(x.final.progreso.devuelto,180);assert.equal(x.recuperacion.sincronizada,true);
+ assert.ok(e.maquina.ordenes.every(x=>[38,40,43,44].includes(x[0])));assert.equal(x.recuperacion.anterior.progreso.introducido,180);
+});
+for(const fallo of ['credito','salida','otra-orden','importe','interrupcion','sin-confirmacion'])test(`confirmar cobro antiguo bloquea ${fallo}`,async t=>{
+ const e=cobroAntiguo(t);
+ if(fallo==='credito')e.maquina.credito=1;
+ if(fallo==='salida')e.maquina.salida=181;
+ if(fallo==='otra-orden'){const x=e.diario.leer(e.op.id);x.comando=9;e.diario.guardar(e.op.id,x);}
+ if(fallo==='importe')e.pedido.introducido_confirmado=600;
+ if(fallo==='interrupcion')e.maquina.interrumpida=e.pedido.interrumpida;
+ if(fallo==='sin-confirmacion')delete e.pedido.introducido_confirmado;
+ await e.run();assert.equal(e.diario.leer(e.op.id).final.estado,'error');assert.ok(e.maquina.ordenes.every(x=>[38,40,43,44].includes(x[0])));
+});

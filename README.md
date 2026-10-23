@@ -99,3 +99,7 @@ El programa es `tpvlucrapp-agente.mjs` (Node.js 18+ también lo ejecuta, pero en
 los hace GitHub Actions (`.github/workflows/programa.yml`) con [Bun](https://bun.sh); en Windows se prueba de verdad
 con una impresora que escribe a un archivo. Al etiquetar `vX.Y.Z` se publican en Releases.
 Para probar contra otro backend: `TPV_API=http://localhost:3001` (y `TPV_AGENTE_DATOS=/carpeta` para no tocar la del sistema).
+
+### 0.8.4 — Cobros con vuelta
+
+Un final Disabled de tipo PAYING informa de la vuelta entregada. La entrada se conserva desde ValueIN y se valida el importe neto, sin confundirlo con el pago final. Una incidencia antigua compatible ofrece «Confirmar cobro ya realizado» tras diagnóstico y confirmación de los importes por el responsable. La conciliación solo consulta la máquina y conserva el historial; el cobro se apunta en su cuenta sin repetir dinero.
