@@ -2,11 +2,15 @@
 // CKMonitor) y por la de consulta (Office). Para probar el programa sin máquina: en las pruebas automáticas
 // (pruebas/directo.mjs) y en local, metiendo «monedas» con el teclado.
 //   node pruebas/cashkeeper-de-mentira.mjs [--control 8001] [--consulta 8002] [--clave 100001]
-// En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; n enseña lo que tiene; q sale.
+// En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; n enseña lo que tiene;
+// f hace fallar el siguiente vaciado de recicladores o cierre por niveles (error 42, sin mover nada); q sale.
 // Sigue el manual del integrador (§7, §8 y anexo 9.2): clave con 47/57/58, 39 Startup, 40 State, 42 Totalize, 9 Disable,
 // 29 Pay, 30 PaySpecific, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation,
-// 11 EmptyCashBox, 17 GetCashBoxLevel, 79 GetLastLevels, y los avisos 100 Disabled, 104 ProcessInterrupted,
-// 106 StateChange, 107 ValueIN y 108 ValueOUT. Las cantidades van en céntimos. Lleva la cuenta de cada moneda y billete:
+// 11 EmptyCashBox, 17 GetCashBoxLevel, 79 GetLastLevels, 38 la divisa, 19 unidades, 44 ValueOUT, 45 ValueToCashBox,
+// 12 EmptyDevice (recicladores a recaudación), 13 por niveles (fondo al cierre), 78 denominaciones, 21/36 aceptación, y los
+// avisos 100 Disabled, 104 ProcessInterrupted, 106 StateChange, 107 ValueIN, 108 ValueOUT y 109 ValueToCashBox. Los
+// ajustes del manual (propiedades, máximos y mínimos, firmware…) no los imita. Las cantidades van en céntimos. Lleva la
+// cuenta de cada moneda y billete:
 // lo que hay para dar cambio (recicladores) y en el cajón de recaudación (los billetes de 50 € van ahí).
 import net from "node:net";
 import readline from "node:readline";
@@ -50,6 +54,10 @@ export function crearCashKeeper(opciones = {}) {
     // Lo metido en esta operación (para devolver lo mismo si se cancela) y el crédito que dejó un Disable sin devolver.
     metidas: [],
     credito: 0,
+    // Lo último que pagó (44 ValueOUT), lo último que pasó del cambio a recaudación (45) y qué valores acepta (21/36).
+    ultimaSalida: 0,
+    transferido: 0,
+    aceptacion: Object.fromEntries(DENOMINACIONES.map((v) => [v, 0])),
     atascada: false,
     totalizes: 0,
     ordenes: [],
@@ -91,6 +99,7 @@ export function crearCashKeeper(opciones = {}) {
       pagado += valor;
       avisar(`$108|${pagado}|${objetivo}|0#`);
     }
+    m.ultimaSalida = pagado;
     return pagado;
   }
 
@@ -118,7 +127,8 @@ export function crearCashKeeper(opciones = {}) {
       }
       m.metidas = [];
       const resto = metido - pagado;
-      if (resto > 0) pagarPiezas(piezasPara(resto) ?? [], metido);
+      if (resto > 0) pagado += pagarPiezas(piezasPara(resto) ?? [], metido);
+      m.ultimaSalida = pagado;
     } else {
       guardarMetidas();
       if (quedarse) m.credito = metido;
@@ -282,6 +292,54 @@ export function crearCashKeeper(opciones = {}) {
         m.prohibidas.push(codigo);
         responder(`$${codigo}|1#`);
         return socket.destroy();
+      case "38":
+      case "19":
+      case "78":
+        // La divisa, las unidades y las denominaciones también se preguntan por la de control (antes de mover dinero, desde el 0.7.0).
+        return atenderConsulta(socket, codigo, p);
+      case "44":
+        return responder(`$44|1|${m.ultimaSalida}#`);
+      case "45":
+        return responder(`$45|1|${m.transferido}#`);
+      case "12":
+      case "13": {
+        // 12 EmptyDevice (1 monedas, 2 billetes, 5 todo) y 13 por niveles (valores y unidades que se quedan): lo que sale de
+        // los recicladores pasa al cajón de recaudación, avisando con 109 ValueToCashBox y al final 100 Disabled.
+        if (m.estado !== 1) return responder(`$${codigo}|0|2|Dispositivo ocupado. No se puede procesar el comando#`);
+        // Tecla f: para probar la incidencia de un vaciado que falla (la máquina lo rechaza y no mueve nada).
+        if (m.fallarVaciado) {
+          m.fallarVaciado = false;
+          return responder(`$${codigo}|0|42|Se produjo un error inesperado al ejecutar el comando#`);
+        }
+        const cual = Number(p[0]) || 5;
+        const quedan = {};
+        if (codigo === "13") {
+          const unidades = String(p[1] ?? "").split(",").map(Number);
+          String(p[0] ?? "").split(",").forEach((v, i) => { quedan[Number(v)] = unidades[i] || 0; });
+        }
+        responder(`$${codigo}|1#`);
+        const estado = codigo === "12" ? 5 : 4;
+        cambiarEstado(estado);
+        const salen = DENOMINACIONES.map((v) => [v, codigo === "12" && !(cual === 5 || (cual === 1 && v < 500) || (cual === 2 && v >= 500)) ? 0 : m.cambio[v] - Math.min(m.cambio[v], quedan[v] ?? 0)]);
+        const objetivo = salen.reduce((suma, [v, n]) => suma + v * n, 0);
+        m.transferido = 0;
+        for (const [v, n] of salen) {
+          if (n <= 0) continue;
+          m.cambio[v] -= n;
+          m.recaudacion[v] += n;
+          m.transferido += n * v;
+          avisar(`$109|${m.transferido}|${objetivo}|0#`);
+        }
+        avisar(`$100|0||${m.transferido}|${m.transferido}|${estado}|0#`);
+        return cambiarEstado(1);
+      }
+      case "21":
+        return responder(`$21|1|${String(p[1] ?? "").split(",").map((v) => m.aceptacion[Number(v)] ?? 0).join(",")}#`);
+      case "36": {
+        const estados = String(p[2] ?? "").split(",").map(Number);
+        String(p[1] ?? "").split(",").forEach((v, i) => { if (Number(v) in m.aceptacion) m.aceptacion[Number(v)] = estados[i] || 0; });
+        return responder("$36|1#");
+      }
       default:
         return responder(`$${codigo}|0|42|Se produjo un error inesperado al ejecutar el comando#`);
     }
@@ -298,6 +356,7 @@ export function crearCashKeeper(opciones = {}) {
   function atenderConsulta(socket, codigo, p) {
     const responder = (texto) => mandar(socket, texto);
     if (codigo === "38") return responder("$38|1|EUR|#");
+    if (codigo === "78") return responder(`$78|1|${DENOMINACIONES.filter((v) => v < 500).join(",")}|${DENOMINACIONES.filter((v) => v >= 500).join(",")}#`);
     if (codigo === "19") return responder(`$19|1|${p[0].split(",").map(v=>m.cambio[Number(v)] ?? 0).join(",")}#`);
     if (codigo === "79" || codigo === "17") return responder(niveles(codigo));
     return responder(`$${codigo}|0|42|Orden no esperada#`);
@@ -386,6 +445,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     if (tecla === "q" || tecla === "\u0003") {
       ck.cerrar();
       process.exit(0);
+    }
+    if (tecla === "f") {
+      ck.maquina.fallarVaciado = true;
+      console.log("El próximo vaciado de recicladores o cierre por niveles fallará (error 42), sin mover nada.");
+      return;
     }
     if (tecla === "n") {
       console.log(`Para dar cambio (${euros(ck.totalCambio())}): ${lista(ck.maquina.cambio)}`);

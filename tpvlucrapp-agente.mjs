@@ -43,8 +43,8 @@ import { actualizarWindows, detenerEjecutableWindows } from './instalacion-windo
 import { marcarCajon, seEstaActualizando, empezarActualizacion, esperarCajonLibre } from './en-marcha.mjs';
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
-import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.5";
+import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
+const VERSION = "0.8.6";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -1242,6 +1242,10 @@ async function trabajar() {
         await recuperarCancelacionesVacias(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
           (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
           .catch(error => log(`CashKeeper: no se pudo aplicar la revisión de la cancelación: ${error.message}`));
+        // Un vaciado de recicladores o un cierre por niveles revisado en la caja: se cierra aquí también (Luis, 24-10).
+        await recuperarMantenimientosRevisados(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
+          (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
+          .catch(error => log(`CashKeeper: no se pudo aplicar la revisión del mantenimiento: ${error.message}`));
         if (diarioCajon.pendientesRecuperacion(m).length && !m.recuperando) {
           m.recuperando = true;
           void recuperarInterrupciones(m, m, diarioCajon,

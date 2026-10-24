@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { operarDirecto } from '../tpvlucrapp-agente.mjs';
 import { operarCkfast } from '../cashkeeper-ckfast.mjs';
-import { DiarioCashKeeper, niveles, inventario, recuperarCancelacionesVacias } from '../cashkeeper-seguro.mjs';
+import { DiarioCashKeeper, niveles, inventario, recuperarCancelacionesVacias, recuperarMantenimientosRevisados } from '../cashkeeper-seguro.mjs';
 
 class Maquina extends EventEmitter {
   // El fsync del diario en el runner Windows puede superar40ms; solo la prueba de timeout usa ese límite.
@@ -213,6 +213,34 @@ for(const caso of ['sin-revision','otro-id','credito','parcial']) test(`recupera
   if(caso==='parcial'){const x=e.diario.leer(o.id);x.final.resultado.fin.actual=100;e.diario.guardar(o.id,x);}
   const antes=e.diario.leer(o.id);let confirmaciones=0;
   const f=()=>recuperarCancelacionesVacias(e.maquina,o,e.diario,async id=>({id:caso==='otro-id'?'otro':id,resolucion:caso==='sin-revision'?null:'cancelacion_vacia',revisada_en:'hoy'}),async()=>{confirmaciones++;return {resuelta:true};});
+  if(caso==='credito')await assert.rejects(f());else await f();
+  assert.deepEqual(e.diario.leer(o.id),antes);assert.equal(confirmaciones,0);
+});
+
+function diarioMantenimiento(e) {
+  const o=op('mantenimiento',{importe_centimos:0,herramienta:{accion:'recicladores',dispositivo:'billetes',confirmado:true}});e.diario.iniciar(o);e.diario.avance(o.id,{comando:12,enviado:true});
+  e.diario.terminar(o.id,{estado:'error',error:'Se produjo un error inesperado al ejecutar el comando (orden 12, error 42 de la máquina)',resultado:{conciliar:true}});
+  return o;
+}
+test('mantenimiento revisado en la caja: se cierra en el diario, conserva el original, desbloquea y no mueve dinero', async t => {
+  const e=entorno(t), o=diarioMantenimiento(e), antes=e.diario.leer(o.id).final;
+  assert.throws(()=>e.diario.iniciar(op('salida',{id:'op-2'})),/pendiente de conciliación/);
+  const revision=async id=>({id,resolucion:'mantenimiento_revisado',revisada_en:new Date().toISOString()});
+  await assert.rejects(recuperarMantenimientosRevisados(e.maquina,o,e.diario,revision,async()=>{throw new Error('sin red');}));
+  assert.equal(e.diario.leer(o.id).final.resultado.conciliar,false);assert.equal(e.diario.leer(o.id).revision.sincronizada,undefined);
+  const nuevo=new DiarioCashKeeper(e.carpeta);let confirmaciones=0;
+  await recuperarMantenimientosRevisados(e.maquina,o,nuevo,revision,async()=>{confirmaciones++;return {resuelta:true};});
+  assert.equal(confirmaciones,1);assert.deepEqual(nuevo.leer(o.id).revision.anterior,antes);assert.equal(nuevo.leer(o.id).revision.sincronizada,true);
+  assert.equal(nuevo.leer(o.id).final.error,antes.error);assert.equal(nuevo.pendientesMantenimiento(o).length,0);
+  assert.ok(e.maquina.ordenes.every(x=>[38,40,43].includes(x[0])));
+  assert.equal(nuevo.iniciar(op('salida',{id:'op-2'})),null);
+});
+for(const caso of ['sin-revision','otro-id','cancelacion_vacia','credito']) test(`mantenimiento revisado rechaza ${caso}`, async t=>{
+  const e=entorno(t),o=diarioMantenimiento(e);
+  if(caso==='credito')e.maquina.credito=10;
+  const antes=e.diario.leer(o.id);let confirmaciones=0;
+  const resolucion=caso==='sin-revision'?null:caso==='cancelacion_vacia'?'cancelacion_vacia':'mantenimiento_revisado';
+  const f=()=>recuperarMantenimientosRevisados(e.maquina,o,e.diario,async id=>({id:caso==='otro-id'?'otro':id,resolucion,revisada_en:'hoy'}),async()=>{confirmaciones++;return {resuelta:true};});
   if(caso==='credito')await assert.rejects(f());else await f();
   assert.deepEqual(e.diario.leer(o.id),antes);assert.equal(confirmaciones,0);
 });

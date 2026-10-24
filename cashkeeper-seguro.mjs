@@ -120,6 +120,16 @@ export class DiarioCashKeeper {
     }).filter(x => x.maquina === maquina && (esCancelacionVaciaAnterior(x) ||
       (x.revision?.resolucion === 'cancelacion_vacia' && !x.revision.sincronizada && esCancelacionVaciaAnterior({ ...x, final: x.revision.anterior }))));
   }
+  /** Mantenimientos de esta máquina sin final o para conciliar (o revisados y sin contárselo aún a la plataforma). */
+  pendientesMantenimiento(op) {
+    if (!fs.existsSync(this.directorio)) return [];
+    const maquina = createHash('sha256').update(`${op.host.toLowerCase()}:${op.puerto}`).digest('hex');
+    return fs.readdirSync(this.directorio).filter(f => f.endsWith('.json')).map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); }
+      catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
+    }).filter(x => x.maquina === maquina && x.tipo === 'mantenimiento' &&
+      (!x.final || x.final.resultado?.conciliar || (x.revision?.resolucion === 'mantenimiento_revisado' && !x.revision.sincronizada)));
+  }
   pendientesRecuperacion(op) {
     if (!fs.existsSync(this.directorio)) return [];
     const maquina = createHash('sha256').update(`${op.host.toLowerCase()}:${op.puerto}`).digest('hex');
@@ -205,6 +215,34 @@ export async function recuperarCancelacionesVacias(m, op, diario, consultar, con
         if (esCancelacionVaciaAnterior(actual)) {
           actual = { ...actual, revision: { ...r, anterior: actual.final, aplicada_en: new Date().toISOString() },
             final: { estado: 'cancelada', resultado: { fin: actual.final.resultado.fin, conciliar: false }, progreso: { ...actual.final.progreso, fase: 'cancelado' } } };
+          diario.guardar(anterior.id, actual);
+        }
+        if ((await confirmar(anterior.id, { estado: 1, credito: 0, interrumpida: false }))?.resuelta === true)
+          diario.guardar(anterior.id, { ...actual, revision: { ...actual.revision, sincronizada: true } });
+      }
+    } finally { m.ocupada = false; liberar(); }
+  });
+}
+/**
+ * Un vaciado de recicladores o un cierre por niveles que quedó para conciliar y que un responsable revisó en la caja (Luis,
+ * 24-10): el dinero no sale de la máquina, así que no se mueve nada; se comprueba que está en reposo, se cierra en el diario
+ * conservando el final anterior y se le cuenta a la plataforma. Solo lo que la plataforma dice revisado.
+ */
+export async function recuperarMantenimientosRevisados(m, op, diario, consultar, confirmar) {
+  if (!diario.pendientesMantenimiento(op).length) return;
+  return m.enTurno(async () => {
+    const liberar = diario.bloquear(op);
+    m.ocupada = true;
+    try {
+      for (const anterior of diario.pendientesMantenimiento(op)) {
+        const r = await consultar(anterior.id);
+        if (r?.resolucion !== 'mantenimiento_revisado' || r.id !== anterior.id || !r.revisada_en) continue;
+        await reposoSeguro(m);
+        let actual = diario.leer(anterior.id);
+        if (actual?.revision?.resolucion !== 'mantenimiento_revisado') {
+          const final = actual?.final ?? { estado: 'error', error: 'Sin final en el diario', resultado: {} };
+          actual = { ...actual, revision: { ...r, anterior: actual?.final ?? null, aplicada_en: new Date().toISOString() },
+            final: { ...final, resultado: { ...final.resultado, conciliar: false } } };
           diario.guardar(anterior.id, actual);
         }
         if ((await confirmar(anterior.id, { estado: 1, credito: 0, interrumpida: false }))?.resuelta === true)
