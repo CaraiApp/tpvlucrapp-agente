@@ -40,10 +40,11 @@ import { fileURLToPath } from "node:url";
 
 import { operarCkfast } from './cashkeeper-ckfast.mjs';
 import { actualizarWindows, detenerEjecutableWindows } from './instalacion-windows.mjs';
+import { marcarCajon, seEstaActualizando, empezarActualizacion, esperarCajonLibre } from './en-marcha.mjs';
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.4";
+const VERSION = "0.8.5";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -412,8 +413,26 @@ async function pararEnSegundoPlano() {
   }
 }
 
+/**
+ * Antes de parar el programa (al actualizarlo o desinstalarlo): que acabe lo que lleve en el cajón automático. Cerrarlo a
+ * medias corta la conexión y la máquina se cierra a medio cobro; mientras, no empieza ninguna operación nueva.
+ */
+async function sinCajonAMedias(trabajo) {
+  const terminar = empezarActualizacion(DATOS);
+  try {
+    await esperarCajonLibre(DATOS, { avisar: () => console.log("El cajón automático está haciendo una operación en este ordenador: se espera a que acabe (no cierres esta ventana)…") });
+    return await trabajo();
+  } finally {
+    terminar();
+  }
+}
+
 /** Copia el programa a su sitio y lo deja arrancando solo con el ordenador (y en marcha ya). */
-async function instalar() {
+function instalar() {
+  return sinCajonAMedias(instalarYa);
+}
+
+async function instalarYa() {
   if (SISTEMA === "windows") {
     return actualizarWindows({ origen: process.execPath, destino: INSTALADO, nombreTarea: NOMBRE_TAREA, ejecutar, parar: pararEnSegundoPlano, registrar: async () => {
       try {
@@ -442,7 +461,11 @@ async function instalar() {
   }
 }
 
-async function desinstalar() {
+function desinstalar() {
+  return sinCajonAMedias(desinstalarYa);
+}
+
+async function desinstalarYa() {
   await pararEnSegundoPlano();
   if (SISTEMA === "windows") {
     await ejecutar("schtasks", ["/Delete", "/TN", NOMBRE_TAREA, "/F"]).catch(() => {});
@@ -571,6 +594,17 @@ export function leerEfectivo(host, puerto, semilla, espera = 15000) {
 
 const ESTADO_CK = ["cerrada", "en reposo", "esperando el dinero", "pagando", "llevando a recaudación", "vaciando", "en error", "contando el dinero"];
 
+/** Lo normal: la máquina contesta al momento (el ejemplo del SDK de CashKeeper espera 5 s y no cierra nunca la conexión). */
+const ESPERA_ORDEN = 10_000;
+/**
+ * Con una operación en marcha no se suelta nunca la máquina por tardar: si se corta la conexión, se cierra a medio cobro
+ * (§8.2.3). Se espera su respuesta hasta 1 minuto; si pasa, no se le manda nada más en esa operación (queda para revisar)
+ * y la conexión se reinicia cuando ya ha acabado y está en el diario.
+ */
+const ATRASO_MAXIMO = 60_000;
+/** Desde cuándo la caja avisa de que la máquina está tardando en contestar. */
+const AVISO_LENTA = 5_000;
+
 export class MaquinaDirecta extends EventEmitter {
   constructor(host, puerto, semilla) {
     super();
@@ -587,7 +621,12 @@ export class MaquinaDirecta extends EventEmitter {
     this.conectando = null;
     this.cola = Promise.resolve();
     this.turno = Promise.resolve();
-    this.ocupada = false;
+    this.enCola = 0;
+    this.enMarcha = false;
+    this.libre = Promise.resolve();
+    this.desfasada = false;
+    this.raroEnOperacion = false;
+    this.esperaOrden = ESPERA_ORDEN; this.atrasoMaximo = ATRASO_MAXIMO; this.avisoLenta = AVISO_LENTA;
     this.interrumpida = null;
     this.mantener = false;
     this.vigilancia = null;
@@ -598,6 +637,32 @@ export class MaquinaDirecta extends EventEmitter {
 
   get donde() {
     return `${this.host}:${this.puerto}`;
+  }
+
+  /** Con una operación en marcha (de dinero o de ajustes de la máquina) la conexión no se suelta nunca. */
+  get ocupada() {
+    return this.enMarcha;
+  }
+
+  set ocupada(valor) {
+    this.enMarcha = valor;
+    // Ya acabada (y en el diario): si la máquina se quedó sin contestar, ahora sí se reinicia la conexión.
+    if (!valor && (this.desfasada || this.esperando?.atrasada)) this.#reiniciar("no contestó a tiempo durante la operación");
+  }
+
+  /** Ni en marcha ni esperando turno: se puede soltar (otra clave, otro ordenador). */
+  get libreDeOperaciones() {
+    return !this.enMarcha && this.enCola === 0;
+  }
+
+  /** La máquina lleva un rato sin contestar a una orden (la caja lo avisa). */
+  get tardando() {
+    return this.desfasada || (!!this.esperando && Date.now() - this.esperando.enviada >= this.avisoLenta);
+  }
+
+  #reiniciar(motivo) {
+    log(`CashKeeper (directo) ${this.donde}: se reinicia la conexión (${motivo})`);
+    this.conexion?.destroy();
   }
 
   /** Conectada, con la clave y arrancada (si no lo estaba, lo hace ahora). */
@@ -630,7 +695,7 @@ export class MaquinaDirecta extends EventEmitter {
     this.conexion = conexion;
     if (this.pausada) { conexion.destroy(); throw new Error("CashKeeper desconectado por el encargado"); }
     this.pendiente = "";
-    conexion.on("data", (trozo) => { try { this.#recibir(trozo); } catch { this.eventoInesperado = true; conexion.destroy(); } });
+    conexion.on("data", (trozo) => { try { this.#recibir(trozo); } catch { this.#raro("un fallo al leer lo que dice"); } });
     conexion.on("close", () => this.#cortada(conexion));
     conexion.on("error", () => {});
     try {
@@ -674,78 +739,138 @@ export class MaquinaDirecta extends EventEmitter {
     });
   }
 
-  /** Una orden de bajo nivel (sin turno): la usan la conexión y `orden`. */
-  #enviar(codigo, parametros, espera) {
+  /**
+   * Una orden de bajo nivel (sin turno): la usan la conexión y `orden`. `paciencia`: lo que espera quien la pide. Sin una
+   * operación en marcha, si no contesta, se cierra la conexión y se vuelve a abrir. Con una en marcha (y `tolerante`), no:
+   * a quien la pidió se le dice que no contesta (`sinRespuesta`), pero la orden sigue esperando su respuesta, que llegará en
+   * orden y se descarta. Hasta entonces no sale otra (`libre`), para no tomar una respuesta atrasada por la de la siguiente.
+   */
+  #enviar(codigo, parametros, paciencia, tolerante = false) {
     return new Promise((resolver, rechazar) => {
       if (!this.conexion) return rechazar(new Error(`Sin conexión con la máquina en ${this.donde}`));
       this.antesDeEnviar?.(codigo);
-      const tiempo = setTimeout(() => {
-        this.esperando = null;
-        rechazar(new Error(`La máquina no contesta (orden ${codigo})`));
-        // Una conexión que no contesta no es de fiar: se cierra y se vuelve a abrir.
-        this.conexion?.destroy();
-      }, espera);
-      this.esperando = {
+      let soltar;
+      this.libre = new Promise((r) => (soltar = r));
+      let tiempo;
+      const acabar = () => (clearTimeout(tiempo), soltar());
+      const e = {
         codigo: String(codigo),
-        resolver: (p) => (clearTimeout(tiempo), resolver(p)),
-        rechazar: (e) => (clearTimeout(tiempo), rechazar(e)),
+        enviada: Date.now(),
+        atrasada: false,
+        resolver: (p) => {
+          acabar();
+          if (e.atrasada) log(`CashKeeper (directo) ${this.donde}: la máquina contestó con ${Math.round((Date.now() - e.enviada) / 1000)} s de retraso (orden ${codigo})`);
+          resolver(p);
+        },
+        rechazar: (error) => (acabar(), rechazar(error)),
       };
+      const vencer = () => {
+        if (this.esperando !== e) return;
+        const pasado = Date.now() - e.enviada;
+        if (!tolerante || !this.ocupada) {
+          // Sin nada en marcha, una conexión que no contesta no es de fiar: se cierra y se vuelve a abrir.
+          this.esperando = null;
+          e.rechazar(new Error(`La máquina no contesta (orden ${codigo})`));
+          this.conexion?.destroy();
+          return;
+        }
+        if (!e.atrasada) {
+          e.atrasada = true;
+          log(`CashKeeper (directo) ${this.donde}: la máquina tarda en contestar (orden ${codigo}); se espera sin cortar`);
+          rechazar(Object.assign(new Error(`La máquina no contesta (orden ${codigo})`), { sinRespuesta: true }));
+        }
+        if (pasado < this.atrasoMaximo) {
+          tiempo = setTimeout(vencer, this.atrasoMaximo - pasado);
+          return;
+        }
+        // Tanto tiempo sin contestar: no se le manda nada más en esta operación (las que esperan turno fallan ya).
+        this.desfasada = true;
+        log(`✗ CashKeeper (directo) ${this.donde}: la máquina lleva ${Math.round(pasado / 1000)} s sin contestar (orden ${codigo}); no se le manda nada más hasta acabar la operación`);
+        soltar();
+      };
+      tiempo = setTimeout(vencer, paciencia);
+      this.esperando = e;
       this.conexion.write(Buffer.from(`$${codigo}${parametros.length ? `|${parametros.join("|")}` : ""}#`, "latin1"));
     });
   }
 
-  /** Una orden a la máquina (de una en una): los datos tras el «1» o un error con el código y el texto de la máquina. */
-  orden(codigo, parametros = [], espera = 10_000) {
+  /**
+   * Una orden a la máquina (de una en una): los datos tras el «1» o un error con el código y el texto de la máquina.
+   * `espera`: lo que aguanta quien la pide; sin ella, 10 s, o 1 minuto con una operación en marcha.
+   */
+  orden(codigo, parametros = [], espera) {
     const turno = this.cola.then(async () => {
       await this.asegurar();
-      return this.#enviar(codigo, parametros, espera);
+      if (this.desfasada) throw Object.assign(new Error("La máquina dejó de contestar: no se le manda nada más hasta revisarla"), { sinRespuesta: true });
+      return this.#enviar(codigo, parametros, espera ?? (this.ocupada ? this.atrasoMaximo : this.esperaOrden), true);
     });
-    this.cola = turno.catch(() => {});
+    // La siguiente no sale hasta que esta tenga su respuesta, aunque quien la pidió ya no la espere.
+    this.cola = turno.catch(() => {}).then(() => this.libre);
     return turno;
   }
 
   /** Las operaciones, de una en una: la máquina no puede cobrar y pagar a la vez. */
   enTurno(trabajo) {
-    const turno = this.turno.then(trabajo);
+    this.enCola++;
+    const turno = this.turno.then(trabajo).finally(() => this.enCola--);
     this.turno = turno.catch(() => {});
     return turno;
   }
 
   #recibir(trozo) {
     this.pendiente += trozo;
-    if (this.pendiente.length > 65536) throw new Error("Respuesta demasiado larga");
+    if (this.pendiente.length > 65536) {
+      this.pendiente = "";
+      return this.#raro("una respuesta demasiado larga");
+    }
     for (let fin = this.pendiente.indexOf("#"); fin >= 0; fin = this.pendiente.indexOf("#")) {
       const mensaje = this.pendiente.slice(0, fin);
       this.pendiente = this.pendiente.slice(fin + 1);
       const inicio = mensaje.indexOf("$");
       if (inicio < 0) continue;
       const [codigo, ...p] = mensaje.slice(inicio + 1).split("|").map((x) => x.trim());
-      if (this.negociando && codigo === this.negociando.codigo) {
-        const n = this.negociando;
-        this.negociando = null;
-        n.resolver(p);
-        continue;
+      // Un mensaje que no se entiende no tapa los que vienen detrás (el siguiente puede ser el Disabled).
+      try {
+        this.#mensaje(codigo, p);
+      } catch {
+        this.#raro(`un mensaje que no se entiende (${String(codigo).slice(0, 6)})`);
       }
-      if (Number(codigo) >= 100) {
-        this.#aviso(Number(codigo), p);
-        continue;
-      }
-      if (this.esperando && codigo === this.esperando.codigo) {
-        const e = this.esperando;
-        this.esperando = null;
-        if (p[0] === "1") e.resolver(p.slice(1));
-        else {
-          const error = new Error(p[2] ? `${p[2]} (orden ${codigo}, error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
-          error.codigo = Number(p[1]);
-          error.rechazoSeguro = (codigo === "29" && [2, 4, 32, 36, 37].includes(error.codigo)) || (codigo === "87" && [2,4,32,34,36,37,38,39,40].includes(error.codigo));
-          e.rechazar(error);
-        }
-      }
-      // Otra respuesta suelta (no se esperaba): se ignora.
     }
   }
 
-  observaciones() { return { avisos: this.avisos.slice(-20), niveles_bajos: this.nivelesBajos, billete_pendiente: this.billetePendiente, pregunta: this.pregunta }; }
+  #mensaje(codigo, p) {
+    if (this.negociando && codigo === this.negociando.codigo) {
+      const n = this.negociando;
+      this.negociando = null;
+      return n.resolver(p);
+    }
+    if (Number(codigo) >= 100) return this.#aviso(Number(codigo), p);
+    if (this.esperando && codigo === this.esperando.codigo) {
+      const e = this.esperando;
+      this.esperando = null;
+      if (p[0] === "1") e.resolver(p.slice(1));
+      else {
+        const error = new Error(p[2] ? `${p[2]} (orden ${codigo}, error ${p[1]} de la máquina)` : `La máquina no ha podido hacerlo (orden ${codigo}, error ${p[1] ?? "?"})`);
+        error.codigo = Number(p[1]);
+        error.rechazoSeguro = (codigo === "29" && [2, 4, 32, 36, 37].includes(error.codigo)) || (codigo === "87" && [2,4,32,34,36,37,38,39,40].includes(error.codigo));
+        e.rechazar(error);
+      }
+    }
+    // Otra respuesta suelta (no se esperaba): se ignora.
+  }
+
+  /**
+   * Algo de la máquina que no se entiende: queda para revisar. Sin nada en marcha, se reinicia la conexión (como siempre);
+   * con algo en marcha, nunca (la máquina se cerraría a medias): la operación acaba «para revisar».
+   */
+  #raro(que) {
+    this.eventoInesperado = true;
+    if (this.ocupada) this.raroEnOperacion = true;
+    log(`✗ CashKeeper (directo) ${this.donde}: ${que}; queda para revisar`);
+    if (!this.ocupada) this.conexion?.destroy();
+  }
+
+  observaciones() { return { avisos: this.avisos.slice(-20), niveles_bajos: this.nivelesBajos, billete_pendiente: this.billetePendiente, pregunta: this.pregunta, maquina_lenta: this.tardando }; }
 
   async responderPregunta(id, aceptar) {
     if (!this.pregunta || this.pregunta.id !== id) return;
@@ -791,6 +916,7 @@ export class MaquinaDirecta extends EventEmitter {
     this.conexion = null;
     this.lista = false;
     this.estado = 0;
+    this.desfasada = false;
     clearTimeout(this.timerPregunta); this.timerPregunta = null; this.pregunta = null;
     if (this.esperando) {
       const e = this.esperando;
@@ -839,10 +965,12 @@ export class MaquinaDirecta extends EventEmitter {
 
 /** Una máquina por dirección (la misma conexión para todas sus operaciones). */
 const maquinasDirectas = new Map();
-function maquinaDirecta(host, puerto, semilla) {
+export function maquinaDirecta(host, puerto, semilla) {
   const clave = `${host}:${Number(puerto) || 8001}`;
   let m = maquinasDirectas.get(clave);
   if (m && semilla && m.semilla !== String(semilla)) {
+    // Clave nueva desde la oficina: se cambia con la máquina libre (soltarla a medio cobro la cerraría a medias).
+    if (!m.libreDeOperaciones) return m;
     m.soltar();
     m = null;
   }
@@ -864,7 +992,7 @@ function mantenerMaquinas(lista = []) {
     m.mantenerViva();
   }
   for (const [clave, m] of maquinasDirectas) {
-    if (!quedan.has(clave) && m.mantener && !m.ocupada) {
+    if (!quedan.has(clave) && m.mantener && m.libreDeOperaciones) {
       m.soltar();
       maquinasDirectas.delete(clave);
     }
@@ -877,9 +1005,20 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
   return m.enTurno(async () => {
     m.ocupada = true;
     m.evidenciaFin = null;
+    m.raroEnOperacion = false;
     const consulta = op.tipo === "prueba" || esConsultaHerramienta(op);
     let liberar; let iniciada = false; let enviado = false; let revision = false; let ultimoProgreso; let finalGuardada;
+    let acabada = false; let ultimoAviso = Date.now(); let ultimoResultado;
     const informar = async (estado, error, resultado, progreso) => {
+      ultimoAviso = Date.now();
+      if (estado === "en_curso") ultimoResultado = resultado;
+      else acabada = true;
+      // Si llegó algo de la máquina que no se entiende, lo que diga el final no es del todo de fiar: queda para revisar.
+      if (["cobrada", "cancelada"].includes(estado) && !consulta && m.raroEnOperacion) {
+        estado = "error";
+        error = "La máquina mandó algo que no se entiende durante la operación: revisa el efectivo antes de seguir";
+        revision = true;
+      }
       if (progreso) { ultimoProgreso = progreso; if (iniciada && !consulta) diario.avance(op.id, { progreso }); }
       if (estado !== "en_curso" && !progreso) progreso = ultimoProgreso;
       // Toda incertidumbre mantiene bloqueada la máquina, también tras reiniciar.
@@ -894,6 +1033,14 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
       if (respuesta?.decision && m.responderPregunta) await m.responderPregunta(respuesta.decision.id, respuesta.decision.aceptar === true);
       return respuesta;
     };
+    // La señal de vida no espera a la máquina: si tarda en contestar, la plataforma sabe que esto sigue (y la caja lo avisa).
+    // Lo normal es contar cada segundo; si en 4 s no se ha contado nada, se cuenta lo último.
+    const cadaLatido = m.latidoCajon ?? 4000;
+    const latido = setInterval(() => {
+      if (acabada || Date.now() - ultimoAviso < cadaLatido) return;
+      void informar("en_curso", null, ultimoResultado, ultimoProgreso).catch(() => {});
+    }, Math.min(1000, cadaLatido));
+    latido.unref?.();
     try {
       if (!consulta) {
         liberar = diario.bloquear(op);
@@ -917,7 +1064,7 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
       if (error.rechazoSeguro && !revision) enviado = false;
       log(`CashKeeper: operación ${op.id} detenida; requiere revisión`);
       await informar("error", error.message, m.evidenciaFin ? { fin: m.evidenciaFin } : undefined);
-    } finally { m.antesDeEnviar = null; m.marcarRevision = null; m.ocupada = false; liberar?.(); }
+    } finally { clearInterval(latido); m.antesDeEnviar = null; m.marcarRevision = null; m.ocupada = false; liberar?.(); }
   });
 }
 
@@ -980,6 +1127,11 @@ async function vigilarCajon(configuracion, op) {
  */
 async function llevarCajon(op, avisar) {
   const donde = `${op.host}:${op.puerto}`;
+  // Un instalador va a cerrar el programa: no se empieza nada nuevo (no ha tocado la máquina: no hay nada que revisar).
+  if (!op.reanudar && op.tipo !== "consulta" && seEstaActualizando(DATOS)) {
+    log(`CashKeeper: operación ${op.id} rechazada porque se está actualizando el programa`);
+    return avisar("error", "Se está actualizando el programa del ordenador de la caja: vuelve a intentarlo en un minuto.", { conciliar: false });
+  }
   // Sin CKMonitor: la conexión directa con la máquina (desde la 0.6.0).
   if (op.modo === "directo" && op.tipo !== "consulta") return operarDirecto(op, avisar);
   try {
@@ -1060,6 +1212,8 @@ async function procesarTrabajo(configuracion, trabajo) {
 /** El bucle de siempre: recoge lo pendiente (espera hasta 25 s) y lo imprime; cada 5 minutos cuenta sus impresoras. */
 async function trabajar() {
   log(`Agente de impresión ${VERSION} (${SISTEMA}, ${os.hostname()})`);
+  // La marca de «operación del cajón en marcha» se renueva mientras dure (sin renovar, el instalador la da por vieja).
+  setInterval(() => { if (cajonEnMarcha.size > 0) marcarCajon(DATOS, true); }, 10_000);
   let ultimoLatido = 0;
   let fallos = 0;
   for (;;) {
@@ -1100,10 +1254,15 @@ async function trabajar() {
       for (const operacion of cajon) {
         if (cajonEnMarcha.has(operacion.id)) continue;
         cajonEnMarcha.add(operacion.id);
+        // La marca va antes de mirar si se está actualizando (llevarCajon): el instalador no cierra el programa a medias.
+        marcarCajon(DATOS, true);
         // Si ya acabó aquí y la plataforma no se enteró, se le cuenta otra vez (no se repite en la máquina).
         const hecha = terminadas.get(operacion.id);
         const trabajo = hecha ? contarFinal(configuracion, operacion.id, hecha.cuerpo) : vigilarCajon(configuracion, operacion);
-        trabajo.finally(() => cajonEnMarcha.delete(operacion.id));
+        trabajo.finally(() => {
+          cajonEnMarcha.delete(operacion.id);
+          marcarCajon(DATOS, cajonEnMarcha.size > 0);
+        });
       }
       for (const trabajo of trabajos) await procesarTrabajo(configuracion, trabajo);
     } catch (error) {

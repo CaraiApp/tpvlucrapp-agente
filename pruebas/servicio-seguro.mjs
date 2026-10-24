@@ -15,11 +15,18 @@ export async function probarServicio(programa, modo) {
   const escuchar=async servidor=>{servidor.listen(0,'127.0.0.1');await once(servidor,'listening');return servidor.address().port;};
   const registrar=s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.on('error',()=>{});};
   let pagos=0;
+  // op-e: la máquina tarda 12 s en contestar a una pregunta de estado a mitad de cobro (más que los 10 s de paciencia).
+  let lento='';let durante=[];let marcaDurante=false;let lentas=0;
   const ck=net.createServer(s=>{registrar(s);let buffer='';s.on('data',trozo=>{
     if(modo==='ckmonitor') {const cmd=trozo.toString();ordenes.push(cmd);const [c,t]=cmd.split('|');s.end(c==='C'?'OK|Added':t==='ticket-a'?'OK|OK':'NOK|Not found');return;}
     buffer+=trozo;
     while(buffer.includes('#')) {const i=buffer.indexOf('#');const cmd=buffer.slice(1,i);buffer=buffer.slice(i+1);ordenes.push(cmd);const [c]=cmd.split('|');
-      if(c==='47')s.write('$57|123#');else if(c==='57')s.write('$58|TEST#');else if(c==='39')s.write('$39|1#$106|1|0#');else if(c==='40')s.write('$40|1|1#');else if(c==='43')s.write('$43|1|0#');else if(c==='38')s.write('$38|1|EUR|#');
+      if(lento==='retenida')durante.push(cmd);
+      if(c==='47')s.write('$57|123#');else if(c==='57')s.write('$58|TEST#');else if(c==='39')s.write('$39|1#$106|1|0#');else if(c==='43')s.write('$43|1|0#');else if(c==='38')s.write('$38|1|EUR|#');
+      else if(c==='40'&&lento==='esperando'){lento='retenida';marcaDurante=fs.existsSync(path.join(datos,'cajon-en-marcha.json'));
+        setTimeout(()=>s.write('$107|450|450|0#$106|1|2#$100|0||450|450|2|0#'),11000);setTimeout(()=>{lento='hecho';s.write('$40|1|2#');},12000);}
+      else if(c==='40')s.write('$40|1|1#');
+      else if(cmd==='42|450|1'){lento='esperando';s.write('$42|1#$106|2|1#');}
       else if(c==='42')s.write('$42|1#$107|500|320|0#$108|180|180|0#$100|0||180|180|3|0#');
       else if(c==='44')s.write('$44|1|180#');else if(c==='52')s.write('$52|1#');
       else if(c==='29'){pagos++;s.write(pagos===1?'$29|1#$108|500|500|0#$100|0||500|500|3|0#':'$29|1#$108|400|500|0#$100|32|Atasco|400|500|3|0#');}
@@ -30,7 +37,7 @@ export async function probarServicio(programa, modo) {
   const impresora=net.createServer(s=>{registrar(s);s.on('data',()=>{recibido=true;});s.on('end',()=>s.end());});
   const puertoImpresora=await escuchar(impresora);
   const ops=['a','b','c'].map(x=>({id:`op-${x}`,ticket:`ticket-${x}`,tipo:'salida',modo,host:'127.0.0.1',puerto,semilla:'100001',importe_centimos:500,propina_centimos:0,reanudar:false,orden:modo==='ckmonitor'?`C|ticket-${x}|-500`:null}));
-  if(modo==='directo')ops.unshift({...ops[0],id:'op-d',tipo:'cobro',importe_centimos:320});
+  if(modo==='directo'){ops.unshift({...ops[0],id:'op-d',tipo:'cobro',importe_centimos:320});ops.splice(1,0,{...ops[0],id:'op-e',importe_centimos:450});ops.push({...ops[2],id:'op-f'});}
   const primera=ops[0].id;
   let trabajo=false;
   const api=http.createServer((req,res)=>{let texto='';req.on('data',x=>texto+=x);req.on('end',()=>{
@@ -43,22 +50,32 @@ export async function probarServicio(programa, modo) {
       const trabajos=trabajo?[]:[{id:'impresion-1',tipo:'prueba',titulo:'Simulador',copias:1,impresora:{id:'impresora-1',nombre:'Simulada',tipo:'red',direccion:'127.0.0.1',puerto:puertoImpresora},datos:Buffer.from('PRUEBA SIN HARDWARE\n').toString('base64')}];trabajo=true;
       return setTimeout(()=>enviar({cajon,trabajos}),100);
     }
-    const m=/\/cajon\/(op-[abcd])\/estado$/.exec(req.url);
-    if(m){const b=JSON.parse(texto);if(b.estado!=='en_curso')finales.set(m[1],b);return enviar({estado:b.estado});}
+    const m=/\/cajon\/(op-[a-f])\/estado$/.exec(req.url);
+    if(m){const b=JSON.parse(texto);if(b.estado!=='en_curso')finales.set(m[1],b);else if(m[1]==='op-e'&&b.resultado?.maquina_lenta===true)lentas++;
+      // Antes de op-f (la última), un instalador «se pone a actualizar» (otro proceso vivo): op-f no debe tocar la máquina.
+      if(m[1]==='op-c'&&b.estado!=='en_curso')fs.writeFileSync(path.join(datos,'actualizando.json'),JSON.stringify({pid:process.pid,en:new Date().toISOString()}));
+      if(m[1]==='op-f'&&b.estado!=='en_curso')fs.rmSync(path.join(datos,'actualizando.json'),{force:true});
+      return enviar({estado:b.estado});}
     if(req.url==='/v1/agente/trabajos/impresion-1/resultado'){impresion=JSON.parse(texto).estado==='impreso';return enviar({ok:true});}
     res.writeHead(404);res.end('{}');
   });});
   const apiPuerto=await escuchar(api);
   const arrancar=()=>{const esScript=programa.endsWith('.mjs');hijo=spawn(esScript?process.execPath:programa,esScript?[programa,'--servicio']:['--servicio'],{env:{...process.env,TPV_API:`http://127.0.0.1:${apiPuerto}`,TPV_AGENTE_TOKEN:'token-sintetico',TPV_AGENTE_DATOS:datos},stdio:'ignore'});};
   const parar=async()=>{if(hijo&&hijo.exitCode===null){const fin=once(hijo,'exit');hijo.kill();await fin;}};
-  const esperar=async fn=>{const limite=Date.now()+20000;while(!fn()&&Date.now()<limite)await new Promise(r=>setTimeout(r,50));assert.ok(fn(),'El servicio no terminó la prueba en 20 s');};
+  const esperar=async fn=>{const limite=Date.now()+45000;while(!fn()&&Date.now()<limite)await new Promise(r=>setTimeout(r,50));assert.ok(fn(),'El servicio no terminó la prueba en 45 s');};
   try {
     arrancar();await esperar(()=>finales.size===ops.length&&impresion);
     assert.equal(finales.get('op-a').estado,'cobrada');assert.equal(finales.get('op-b').resultado.conciliar,true);assert.equal(finales.get('op-c').resultado.conciliar,true);assert.ok(recibido);
-    if(modo==='directo'){assert.equal(finales.get('op-d').estado,'cobrada');assert.equal(finales.get('op-d').progreso.introducido,500);assert.equal(finales.get('op-d').progreso.devuelto,180);}
+    if(modo==='directo'){assert.equal(finales.get('op-d').estado,'cobrada');assert.equal(finales.get('op-d').progreso.introducido,500);assert.equal(finales.get('op-d').progreso.devuelto,180);
+      // La máquina tardó 12 s: el cobro acaba bien, sin soltar la conexión, sin otra orden encima y avisando a la caja.
+      assert.equal(finales.get('op-e').estado,'cobrada',finales.get('op-e').error);assert.equal(finales.get('op-e').progreso.introducido,450);
+      assert.deepEqual(durante,[]);assert.ok(lentas>=1,'la caja supo que la máquina tardaba');assert.ok(marcaDurante,'marca de operación en marcha para el instalador');
+      assert.equal(ordenes.filter(x=>x==='47').length,1,'una sola conexión con la máquina');
+      // Durante una actualización no se empieza nada: error sin nada que revisar y sin mover dinero.
+      assert.equal(finales.get('op-f').estado,'error');assert.equal(finales.get('op-f').resultado.conciliar,false);}
     const movidas=()=>ordenes.filter(x=>modo==='directo'?x.startsWith('29|'):x.startsWith('C|')).length;
-    assert.equal(movidas(),2);await parar();finales.delete(primera);reponer=true;arrancar();await esperar(()=>finales.has(primera));assert.equal(finales.get(primera).estado,'cobrada');assert.equal(movidas(),2);if(modo==='directo')assert.equal(ordenes.filter(x=>x.startsWith('42|')).length,1);
-    console.log(`PASS servicio ${modo}: éxito, parcial/incierto, bloqueo, impresión y replay tras reinicio sin mover dinero otra vez`);
+    assert.equal(movidas(),2);await parar();finales.delete(primera);reponer=true;arrancar();await esperar(()=>finales.has(primera));assert.equal(finales.get(primera).estado,'cobrada');assert.equal(movidas(),2);if(modo==='directo')assert.equal(ordenes.filter(x=>x.startsWith('42|320|')).length,1);
+    console.log(`PASS servicio ${modo}: éxito, parcial/incierto, bloqueo, impresión y replay tras reinicio sin mover dinero otra vez${modo==='directo'?'; máquina lenta sin cortar y nada nuevo durante una actualización':''}`);
   } catch(e) {console.error('Estados simulados:',Object.fromEntries(finales));throw e;}
   finally {await parar();api.closeAllConnections();for(const s of sockets)s.destroy();await Promise.all([api,ck,impresora].map(s=>new Promise(r=>s.close(r))));fs.rmSync(datos,{recursive:true,force:true});}
 }

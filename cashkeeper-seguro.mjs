@@ -59,6 +59,21 @@ export async function hastaDisabled(m, empezar, cada = async () => {}, { timeout
   } finally { m.esperandoDisabled = false; clearTimeout(timer); m.off('100', alFin); m.off('cortada', alCorte); }
 }
 
+/**
+ * El estado mientras se espera el final de una operación, sin atascar la espera: si la máquina tarda (o aún no ha contestado
+ * a la pregunta anterior), null y se mira en la vuelta siguiente. La conexión no se corta por eso.
+ */
+export async function estadoSiContesta(m) {
+  if (m.desfasada || m.esperando?.atrasada) return null;
+  try {
+    const [estado] = await m.orden(40, [], m.esperaOrden ?? 10_000);
+    return entero(estado, 7);
+  } catch (e) {
+    if (e.sinRespuesta) return null;
+    throw e;
+  }
+}
+
 /** Diario durable antes de mover dinero; nunca guarda semilla, token, orden de acceso ni nombres. */
 export class DiarioCashKeeper {
   constructor(directorio) { this.directorio = directorio; }

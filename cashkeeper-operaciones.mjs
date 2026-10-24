@@ -1,5 +1,5 @@
 // Operaciones físicas: ninguna respuesta OK sustituye a Disabled (§9.4.2).
-import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision, seleccion } from './cashkeeper-seguro.mjs';
+import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision, seleccion, estadoSiContesta } from './cashkeeper-seguro.mjs';
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 const total = xs => xs.reduce((s, x) => s + x.valor * x.unidades, 0);
 
@@ -39,9 +39,8 @@ export async function operarEnMaquina(m, op, avisar) {
     }, async () => {
       const r = await contar().catch(() => null);
       if (saca || accion) return;
-      const [estado] = await m.orden(40);
-      // Disable solo en ENABLED. Si valida, esperar a la siguiente lectura.
-      if (entero(estado, 7) !== 2) return;
+      // Disable solo en ENABLED. Si valida, o la máquina tarda en contestar, esperar a la siguiente lectura.
+      if (await estadoSiContesta(m) !== 2) return;
       if (r?.cancelar || Date.now() > limite) {
         accion = 'cancelar'; progreso.fase = 'cancelando'; await m.orden(9, [1]);
       } else if (abierta && r?.terminar) {
@@ -136,8 +135,7 @@ async function cambiar(m, avisar) {
     fin = await hastaDisabled(m, () => m.orden(14), async () => {
       const r = await contar().catch(() => null);
       if (accion) return;
-      const [estado] = await m.orden(40);
-      if (entero(estado, 7) !== 2) return;
+      if (await estadoSiContesta(m) !== 2) return;
       if (r?.cancelar || Date.now() > limite) { accion = 'cancelar'; await m.orden(9, [1]); }
       else if (r?.terminar) { accion = 'aceptar'; await m.orden(9, [0]); }
     });
