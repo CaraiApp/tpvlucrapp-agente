@@ -16,10 +16,10 @@ import net from "node:net";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-const DENOMINACIONES = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+export const DENOMINACIONES = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
 /** Lo que tiene al empezar para dar cambio (unidades de cada valor) y en el cajón de recaudación. */
-const CAMBIO_DE_SERIE = { 5: 20, 10: 20, 20: 20, 50: 20, 100: 20, 200: 20, 500: 10, 1000: 10, 2000: 5, 5000: 0 };
-const RECAUDACION_DE_SERIE = { 100: 5, 200: 3, 2000: 1, 5000: 2 };
+export const CAMBIO_DE_SERIE = { 5: 20, 10: 20, 20: 20, 50: 20, 100: 20, 200: 20, 500: 10, 1000: 10, 2000: 5, 5000: 0 };
+export const RECAUDACION_DE_SERIE = { 100: 5, 200: 3, 2000: 1, 5000: 2 };
 const total = (unidades) => Object.entries(unidades).reduce((suma, [valor, n]) => suma + Number(valor) * n, 0);
 
 export function crearCashKeeper(opciones = {}) {
@@ -39,6 +39,8 @@ export function crearCashKeeper(opciones = {}) {
     // Simula un atasco (una vez) al pagar con PaySpecific las unidades de este valor: no salen y acaba con error.
     atasco = null,
     contar = () => {},
+    // Cada mensaje y cada conexión, para enseñarlos (el panel de palomitas): (sentido «entra» | «sale» | «conexion», texto, «control» | «consulta»).
+    traza = () => {},
   } = opciones;
 
   const m = {
@@ -68,7 +70,11 @@ export function crearCashKeeper(opciones = {}) {
   let temporizador = null;
   let monedasDeEsta = 0;
 
-  const mandar = (socket, texto) => socket && !socket.destroyed && socket.write(Buffer.from(texto, "latin1"));
+  const mandar = (socket, texto) => {
+    if (!socket || socket.destroyed) return false;
+    traza("sale", texto, socket === m.cliente ? "control" : "consulta");
+    return socket.write(Buffer.from(texto, "latin1"));
+  };
   const avisar = (texto) => mandar(m.cliente, texto);
   const cambiarEstado = (nuevo) => {
     const antes = m.estado;
@@ -366,7 +372,11 @@ export function crearCashKeeper(opciones = {}) {
     return net
       .createServer((socket) => {
         // La conexión de control tiene un solo dueño (si no, sería CKMonitor y el programa a la vez).
-        if (esControl && m.cliente && !m.cliente.destroyed) return socket.destroy();
+        if (esControl && m.cliente && !m.cliente.destroyed) {
+          traza("conexion", "rechazada", "control");
+          return socket.destroy();
+        }
+        traza("conexion", "abierta", esControl ? "control" : "consulta");
         let pendiente = "";
         let dentro = false;
         socket.setEncoding("latin1");
@@ -377,6 +387,7 @@ export function crearCashKeeper(opciones = {}) {
             const mensaje = pendiente.slice(pendiente.indexOf("$") + 1, fin);
             pendiente = pendiente.slice(fin + 1);
             const [codigo, ...p] = mensaje.split("|");
+            traza("entra", `$${mensaje}#`, esControl ? "control" : "consulta");
             if (codigo === "47") {
               mandar(socket, `$57|${numero}#`);
               continue;
@@ -393,6 +404,7 @@ export function crearCashKeeper(opciones = {}) {
           }
         });
         socket.on("close", () => {
+          traza("conexion", "cerrada", esControl ? "control" : "consulta");
           if (!esControl || m.cliente !== socket) return;
           // Sin su dueño, la máquina se cierra (y guarda lo que hacía a medias).
           clearInterval(temporizador);
