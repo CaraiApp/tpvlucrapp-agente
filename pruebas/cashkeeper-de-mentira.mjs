@@ -5,7 +5,7 @@
 // En la ventana: 1 y 2 meten monedas de 1 y 2 €; 5, 0, v y c, billetes de 5, 10, 20 y 50 €; n enseña lo que tiene;
 // f hace fallar el siguiente vaciado de recicladores o cierre por niveles (error 42, sin mover nada); q sale.
 // Sigue el manual del integrador (§7, §8 y anexo 9.2): clave con 47/57/58, 39 Startup, 40 State, 42 Totalize, 9 Disable,
-// 29 Pay, 30 PaySpecific, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation,
+// 29 Pay, 30 PaySpecific, 87 PaySpecificEx, 14 Enable, 43 ValueIN, 67 ActivateRefillMode, 52 DiscardOperation, 68 DiscardPayOperation,
 // 11 EmptyCashBox, 17 GetCashBoxLevel, 79 GetLastLevels, 38 la divisa, 19 unidades, 44 ValueOUT, 45 ValueToCashBox,
 // 12 EmptyDevice (recicladores a recaudación), 13 por niveles (fondo al cierre), 78 denominaciones, 21/36 aceptación, y los
 // avisos 100 Disabled, 104 ProcessInterrupted, 106 StateChange, 107 ValueIN, 108 ValueOUT y 109 ValueToCashBox. Los
@@ -236,7 +236,10 @@ export function crearCashKeeper(opciones = {}) {
         return empezarCliente();
       }
       case "43":
-        return responder(`$43|1|${m.introducido}#`);
+        // GetValueIN: el crédito de la operación. Mientras acepta dinero, lo metido; tras un Disable sin devolver (9|0), lo
+        // que se quedó, hasta que el programa lo olvide con 52 DiscardOperation (como la máquina real: el programa lo
+        // comprueba al aceptar una entrada sin importe y al cambiar efectivo).
+        return responder(`$43|1|${m.estado === 2 || m.estado === 7 ? m.introducido : m.credito}#`);
       case "9": {
         if (m.estado !== 2 && m.estado !== 7) return responder("$9|0|36|El dispositivo no está habilitado. No se puede procesar el comando#");
         responder("$9|1#");
@@ -255,15 +258,17 @@ export function crearCashKeeper(opciones = {}) {
         avisar(`$100|0||${valor}|${valor}|3|0#`);
         return cambiarEstado(1);
       }
-      case "30": {
-        // PaySpecific: valores y unidades separados por comas, y si es solo una prueba.
-        if (m.estado !== 1) return responder("$30|0|2|Dispositivo ocupado. No se puede procesar el comando#");
+      case "30":
+      case "87": {
+        // PaySpecific (30) y PaySpecificEx (87, la salida eligiendo piezas): valores y unidades separados por comas, y si es
+        // solo una prueba.
+        if (m.estado !== 1) return responder(`$${codigo}|0|2|Dispositivo ocupado. No se puede procesar el comando#`);
         const valores = String(p[0] ?? "").split(",").map(Number);
         const unidades = String(p[1] ?? "").split(",").map(Number);
         if (valores.length !== unidades.length || valores.some((v, i) => !(m.cambio[v] >= unidades[i]) || !(unidades[i] > 0))) {
-          return responder("$30|0|32|No hay importe suficiente para realizar el pago#");
+          return responder(`$${codigo}|0|32|No hay importe suficiente para realizar el pago#`);
         }
-        responder("$30|1#");
+        responder(`$${codigo}|1#`);
         if (p[2] === "1") return;
         const pedido = valores.reduce((suma, v, i) => suma + v * unidades[i], 0);
         cambiarEstado(3);
