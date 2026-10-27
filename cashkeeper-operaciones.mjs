@@ -50,7 +50,7 @@ export async function operarEnMaquina(m, op, avisar) {
     });
     if (fin.cortada) throw revision('Se perdió la conexión durante el movimiento. Resultado incierto; no repetir.');
     if (eventoAjeno) throw revision('Se recibieron importes de otra operación');
-    let entrada;
+    let entrada; let conVuelta = false;
     if (saca) progreso.devuelto = fin.actual;
     else if (fin.estado === 3) {
       // Disabled PAYING describe la vuelta, no el dinero introducido (§9.2.3).
@@ -65,9 +65,13 @@ export async function operarEnMaquina(m, op, avisar) {
       // 27-10). Los tres son el final de una entrada; lo demás (pagar, flotar, vaciar, error) no.
       // Si se vio meter más de lo que la máquina contó al final (un billete que devolvió por falta de cambio, 27-10), manda el
       // Disabled cuando cobró justo el objetivo, sin error y sin vuelta: lo devuelto nunca llegó a contar.
-      const billeteDevuelto = observado.introducido > fin.actual && objetivo > 0 && fin.error === 0 && fin.actual === objetivo && fin.objetivo === objetivo && observado.devuelto === 0;
-      if (![1, 2, 7].includes(fin.estado) || (observado.introducido > fin.actual && !billeteDevuelto)) throw revision('El final no corresponde a la entrada de efectivo');
-      progreso.introducido = fin.actual;
+      const justo = observado.introducido > fin.actual && objetivo > 0 && fin.error === 0 && fin.actual === objetivo && fin.objetivo === objetivo;
+      const billeteDevuelto = justo && observado.devuelto === 0;
+      // CKVirtual da la vuelta avisando cada pago (108) y acaba en reposo con lo cobrado (27-10): vale si lo metido menos la
+      // vuelta que avisó es justo lo cobrado. Una vuelta a medias no cuadra y queda para revisar.
+      conVuelta = justo && observado.devuelto > 0 && observado.introducido - observado.devuelto === objetivo;
+      if (![1, 2, 7].includes(fin.estado) || (observado.introducido > fin.actual && !billeteDevuelto && !conVuelta)) throw revision('El final no corresponde a la entrada de efectivo');
+      progreso.introducido = conVuelta ? observado.introducido : fin.actual;
     }
     await contar().catch(() => {});
     await comprobarFin(m, fin);
@@ -84,7 +88,7 @@ export async function operarEnMaquina(m, op, avisar) {
     } else {
       const esperado = accion === 'cancelar' ? progreso.introducido : progreso.introducido - objetivo;
       // ValueOUT conserva el último pago: un cobro exacto no tiene vuelta que consultar.
-      progreso.devuelto = esperado === 0 && fin.estado !== 3 && observado.devuelto === 0 ? 0 : entero((await m.orden(44))[0]);
+      progreso.devuelto = conVuelta ? observado.devuelto : esperado === 0 && fin.estado !== 3 && observado.devuelto === 0 ? 0 : entero((await m.orden(44))[0]);
       const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo;
       if (esperado < 0 || progreso.devuelto !== esperado || !terminalCoherente) throw revision('El efectivo recibido y la devolución no cuadran');
       await limpiarCreditoConfirmado(m, fin.operacion);

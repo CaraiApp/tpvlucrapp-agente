@@ -44,7 +44,7 @@ import { marcarCajon, seEstaActualizando, empezarActualizacion, esperarCajonLibr
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.9";
+const VERSION = "0.8.10";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
