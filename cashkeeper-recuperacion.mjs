@@ -29,7 +29,9 @@ export function validarRecuperacion(anterior, pedido, interrumpida) {
   // en revisión: los importes siguen como crédito de la operación. Solo se conservan (52 y comprobar crédito a cero).
   if (pedido.origen === 'entrada_terminada') {
     const f = anterior.final?.resultado?.fin; const a = anterior.final?.progreso;
-    if (!pedido.id || pedido.accion !== 'conservar' || interrumpida || anterior.tipo !== 'entrada' || anterior.objetivo !== 0 ||
+    // Si la máquina se reconectó con ese crédito, lo avisa como proceso interrumpido (104): vale si es el mismo dinero.
+    const mismaInterrupcion = !interrumpida || (interrumpida.valor === f?.actual && interrumpida.objetivo === 0 && interrumpida.operacion === 0 && interrumpida.estado !== 3);
+    if (!pedido.id || pedido.accion !== 'conservar' || !mismaInterrupcion || anterior.tipo !== 'entrada' || anterior.objetivo !== 0 ||
       anterior.final?.estado !== 'error' || anterior.final?.error !== 'El final no corresponde a la entrada de efectivo' || !anterior.final?.resultado?.conciliar ||
       !f || f.estado !== 1 || f.error !== 0 || f.operacion !== 0 || f.objetivo !== 0 || !(entero(f.actual) > 0) ||
       a?.introducido !== f.actual || (a.devuelto ?? 0) !== 0 ||
