@@ -25,6 +25,19 @@ export function validarRecuperacion(anterior, pedido, interrumpida) {
       throw revision('El diario no acredita un cambio aceptado sin ninguna orden de pago. Revisa el efectivo; no se enviará dinero.');
     return { entrada:false, cambioSinPago:true, objetivo:p.valor, restante:p.valor, estado:'cancelada' };
   }
+  // Un cobro que la máquina terminó justo (2,50 € de 2,50 €, sin error ni vuelta) tras devolver un billete por falta de cambio,
+  // que el programa 0.8.8 dejó en revisión por haber visto meter más (27-10). Solo se confirma: no se manda ninguna orden.
+  if (pedido.origen === 'cobro_terminado') {
+    const f = anterior.final?.resultado?.fin; const a = anterior.final?.progreso;
+    const objetivo = anterior.objetivo + (anterior.propina ?? 0);
+    if (!pedido.id || pedido.accion !== 'confirmar_cobro' || interrumpida || anterior.tipo !== 'cobro' || !(objetivo > 0) ||
+      anterior.final?.estado !== 'error' || anterior.final?.error !== 'El final no corresponde a la entrada de efectivo' || !anterior.final?.resultado?.conciliar ||
+      !f || ![1, 2, 7].includes(f.estado) || f.error !== 0 || f.operacion !== 0 || f.actual !== objetivo || f.objetivo !== objetivo ||
+      (a?.devuelto ?? 0) !== 0 || !(a?.introducido > f.actual) ||
+      !p || p.estado !== f.estado || p.valor !== f.actual || p.objetivo !== f.objetivo || p.operacion !== 0)
+      throw revision('El diario no acredita un cobro terminado justo. Revisa el efectivo; no se moverá dinero.');
+    return { entrada:false, cobroTerminado:true, objetivo, introducido:objetivo, restante:0, estado:'cobrada' };
+  }
   // Una entrada que la máquina terminó (Disabled en reposo, estado 1, como CKVirtual) y el programa anterior a la 0.8.7 dejó
   // en revisión: los importes siguen como crédito de la operación. Solo se conservan (52 y comprobar crédito a cero).
   if (pedido.origen === 'entrada_terminada') {
@@ -89,6 +102,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
           const plan = validarRecuperacion(local, pedido, m.interrumpida);
           const [estado] = await m.orden(40); const [divisa] = await m.orden(38);
           if (entero(estado, 7) !== 1 || divisa !== 'EUR' || m.eventoInesperado) throw revision('La máquina no está preparada para recuperar esta operación');
+          if (plan.cobroTerminado && entero((await m.orden(43, [255]))[0]) !== 0) throw revision('Hay crédito en la máquina: no se puede confirmar el cobro');
           if (pedido.origen === 'terminal' || plan.cobroConVuelta) {
             const [salida] = await m.orden(44); const [credito] = await m.orden(43,[255]);
             if (entero(salida) !== pedido.interrumpida.valor || entero(credito) !== 0) throw revision('El último pago o el crédito ha cambiado; no se puede recuperar con esta evidencia');
@@ -104,7 +118,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
               enviado = true; local = { ...local, recuperacion: { ...local.recuperacion, comando: codigo, enviado: true } }; diario.guardar(anterior.id, local);
             }
           };
-          const progreso = { fase: plan.entrada || plan.entradaTerminada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.cobroConVuelta ? plan.introducido : plan.entrada || plan.entradaTerminada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago || plan.entradaTerminada ? 0 : pedido.interrumpida.valor };
+          const progreso = { fase: plan.entrada || plan.entradaTerminada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.cobroConVuelta || plan.cobroTerminado ? plan.introducido : plan.entrada || plan.entradaTerminada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago || plan.entradaTerminada || plan.cobroTerminado ? 0 : pedido.interrumpida.valor };
           const contar = async () => {
             const r = await informar(anterior.id, { recuperacion_id: pedido.id, estado: 'en_curso', progreso, ...(m.observaciones?.() ?? {}) });
             if (r?.decision && m.responderPregunta) await m.responderPregunta(r.decision.id, r.decision.aceptar === true);
@@ -118,6 +132,9 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
             if (plan.cobroConVuelta) {
               // Conciliación confirmada por el responsable: solo lecturas, nunca cobrar, pagar ni borrar crédito.
               fin=local.final.resultado.fin;
+            } else if (plan.cobroTerminado) {
+              // La máquina ya lo confirmó: solo lecturas.
+              fin = local.final.resultado.fin;
             } else if (plan.entradaTerminada) {
               // El dinero ya está dentro y la máquina terminó: solo se suelta el crédito (52) y se comprueba que queda a cero.
               await limpiarCreditoConfirmado(m, 0);

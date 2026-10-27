@@ -63,7 +63,10 @@ export async function operarEnMaquina(m, op, avisar) {
     } else {
       // El Disabled trae el estado de la máquina: la real dice 2 o 7 (el de antes de cerrar) y CKVirtual, 1 (ya en reposo,
       // 27-10). Los tres son el final de una entrada; lo demás (pagar, flotar, vaciar, error) no.
-      if (![1, 2, 7].includes(fin.estado) || observado.introducido > fin.actual) throw revision('El final no corresponde a la entrada de efectivo');
+      // Si se vio meter más de lo que la máquina contó al final (un billete que devolvió por falta de cambio, 27-10), manda el
+      // Disabled cuando cobró justo el objetivo, sin error y sin vuelta: lo devuelto nunca llegó a contar.
+      const billeteDevuelto = observado.introducido > fin.actual && objetivo > 0 && fin.error === 0 && fin.actual === objetivo && fin.objetivo === objetivo && observado.devuelto === 0;
+      if (![1, 2, 7].includes(fin.estado) || (observado.introducido > fin.actual && !billeteDevuelto)) throw revision('El final no corresponde a la entrada de efectivo');
       progreso.introducido = fin.actual;
     }
     await contar().catch(() => {});
