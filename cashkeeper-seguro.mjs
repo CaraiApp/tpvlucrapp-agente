@@ -188,7 +188,8 @@ export async function limpiarCreditoConfirmado(m, operacion) {
 }
 /** ValueOUT (44) no identifica la operación. En una cancelación vacía no hay devolución que leer. */
 export async function confirmarCancelacionVacia(m, fin, observado) {
-  if (fin.error !== 0 || fin.actual !== 0 || fin.operacion !== 0 || fin.estado !== 2 || observado.introducido !== 0 || observado.devuelto !== 0 || m.eventoInesperado) throw revision('La cancelación vacía tiene evidencia contradictoria');
+  // Estado 2 (la real) o 1 (CKVirtual: ya en reposo), como en las entradas.
+  if (fin.error !== 0 || fin.actual !== 0 || fin.operacion !== 0 || ![1, 2].includes(fin.estado) || observado.introducido !== 0 || observado.devuelto !== 0 || m.eventoInesperado) throw revision('La cancelación vacía tiene evidencia contradictoria');
   for (const operacion of [fin.operacion, 255]) {
     const [credito] = await m.orden(43, [operacion]);
     if (entero(credito) !== 0) throw revision('Sigue habiendo crédito: no se puede confirmar una cancelación vacía');

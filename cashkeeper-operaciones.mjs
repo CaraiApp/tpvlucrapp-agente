@@ -61,7 +61,9 @@ export async function operarEnMaquina(m, op, avisar) {
       progreso.introducido = recibido; progreso.devuelto = fin.actual;
       entrada = { valor: recibido, operacion: fin.operacion, fuente: observado.introducido ? 'evento107' : 'valuein43' };
     } else {
-      if (![2, 7].includes(fin.estado) || observado.introducido > fin.actual) throw revision('El final no corresponde a la entrada de efectivo');
+      // El Disabled trae el estado de la máquina: la real dice 2 o 7 (el de antes de cerrar) y CKVirtual, 1 (ya en reposo,
+      // 27-10). Los tres son el final de una entrada; lo demás (pagar, flotar, vaciar, error) no.
+      if (![1, 2, 7].includes(fin.estado) || observado.introducido > fin.actual) throw revision('El final no corresponde a la entrada de efectivo');
       progreso.introducido = fin.actual;
     }
     await contar().catch(() => {});

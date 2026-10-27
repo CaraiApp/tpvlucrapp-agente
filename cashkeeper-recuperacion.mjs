@@ -25,6 +25,18 @@ export function validarRecuperacion(anterior, pedido, interrumpida) {
       throw revision('El diario no acredita un cambio aceptado sin ninguna orden de pago. Revisa el efectivo; no se enviará dinero.');
     return { entrada:false, cambioSinPago:true, objetivo:p.valor, restante:p.valor, estado:'cancelada' };
   }
+  // Una entrada que la máquina terminó (Disabled en reposo, estado 1, como CKVirtual) y el programa anterior a la 0.8.7 dejó
+  // en revisión: los importes siguen como crédito de la operación. Solo se conservan (52 y comprobar crédito a cero).
+  if (pedido.origen === 'entrada_terminada') {
+    const f = anterior.final?.resultado?.fin; const a = anterior.final?.progreso;
+    if (!pedido.id || pedido.accion !== 'conservar' || interrumpida || anterior.tipo !== 'entrada' || anterior.objetivo !== 0 ||
+      anterior.final?.estado !== 'error' || anterior.final?.error !== 'El final no corresponde a la entrada de efectivo' || !anterior.final?.resultado?.conciliar ||
+      !f || f.estado !== 1 || f.error !== 0 || f.operacion !== 0 || f.objetivo !== 0 || !(entero(f.actual) > 0) ||
+      a?.introducido !== f.actual || (a.devuelto ?? 0) !== 0 ||
+      !p || p.estado !== 1 || p.valor !== f.actual || p.objetivo !== 0 || p.operacion !== 0)
+      throw revision('El diario no acredita una entrada terminada con ese crédito. Revisa el efectivo; no se moverá dinero.');
+    return { entrada:false, entradaTerminada:true, objetivo:f.actual, estado:'cobrada' };
+  }
   const terminal = pedido.origen === 'terminal'; const f = anterior.final?.resultado?.fin;
   const evidencia = terminal && !interrumpida && f?.estado === 3 && f.error > 0 && f.operacion === 0 && f.actual === anterior.final?.progreso?.devuelto
     ? {estado:3,valor:f.actual,objetivo:f.objetivo,operacion:0} : terminal ? null : interrumpida;
@@ -82,7 +94,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
           if (plan.cambioSinPago && entero((await m.orden(43,[255]))[0]) !== 0)
             throw revision('Hay crédito en la máquina: no se puede devolver una deuda externa hasta revisarlo');
           // El crédito debe corresponder exactamente al evento de interrupción de entrada.
-          if (plan.entrada) { const [credito] = await m.orden(43, [0]); if (entero(credito) !== pedido.interrumpida.valor) throw revision('El crédito no coincide con la interrupción'); }
+          if (plan.entrada || plan.entradaTerminada) { const [credito] = await m.orden(43, [0]); if (entero(credito) !== pedido.interrumpida.valor) throw revision('El crédito no coincide con la interrupción'); }
           local = { ...local, recuperacion: { ...pedido, anterior: local.final ?? null, iniciada_en: new Date().toISOString() } };
           diario.guardar(anterior.id, local);
           m.antesDeEnviar = codigo => {
@@ -90,7 +102,7 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
               enviado = true; local = { ...local, recuperacion: { ...local.recuperacion, comando: codigo, enviado: true } }; diario.guardar(anterior.id, local);
             }
           };
-          const progreso = { fase: plan.entrada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.cobroConVuelta ? plan.introducido : plan.entrada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago ? 0 : pedido.interrumpida.valor };
+          const progreso = { fase: plan.entrada || plan.entradaTerminada ? 'metiendo' : 'pagando', objetivo: plan.objetivo, introducido: plan.cobroConVuelta ? plan.introducido : plan.entrada || plan.entradaTerminada ? pedido.interrumpida.valor : anterior.tipo === 'cambio' ? plan.objetivo : 0, devuelto: plan.entrada || plan.cambioSinPago || plan.entradaTerminada ? 0 : pedido.interrumpida.valor };
           const contar = async () => {
             const r = await informar(anterior.id, { recuperacion_id: pedido.id, estado: 'en_curso', progreso, ...(m.observaciones?.() ?? {}) });
             if (r?.decision && m.responderPregunta) await m.responderPregunta(r.decision.id, r.decision.aceptar === true);
@@ -104,6 +116,10 @@ export async function recuperarInterrupciones(m, op, diario, consultar, informar
             if (plan.cobroConVuelta) {
               // Conciliación confirmada por el responsable: solo lecturas, nunca cobrar, pagar ni borrar crédito.
               fin=local.final.resultado.fin;
+            } else if (plan.entradaTerminada) {
+              // El dinero ya está dentro y la máquina terminó: solo se suelta el crédito (52) y se comprueba que queda a cero.
+              await limpiarCreditoConfirmado(m, 0);
+              fin = local.final.resultado.fin;
             } else if (pedido.accion === 'cerrar_pago') {
               await m.orden(68); // No paga; cierra la parte que el responsable decidió no continuar.
             } else {
