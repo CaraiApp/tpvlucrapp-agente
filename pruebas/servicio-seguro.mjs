@@ -65,7 +65,9 @@ export async function probarServicio(programa, modo) {
   const esperar=async fn=>{const limite=Date.now()+45000;while(!fn()&&Date.now()<limite)await new Promise(r=>setTimeout(r,50));assert.ok(fn(),'El servicio no terminó la prueba en 45 s');};
   try {
     arrancar();await esperar(()=>finales.size===ops.length&&impresion);
-    assert.equal(finales.get('op-a').estado,'cobrada');assert.equal(finales.get('op-b').resultado.conciliar,true);assert.equal(finales.get('op-c').resultado.conciliar,true);assert.ok(recibido);
+    assert.equal(finales.get('op-a').estado,'cobrada');assert.equal(finales.get('op-b').resultado.conciliar,true);
+    // op-c la rechaza el diario sin tocar la máquina (op-b sigue pendiente): error claro, pero NO otra incidencia (5-11, Kursaal).
+    assert.equal(finales.get('op-c').estado,'error');assert.equal(finales.get('op-c').resultado.conciliar,false);assert.match(finales.get('op-c').error,/pendiente de conciliación/);assert.ok(recibido);
     if(modo==='directo'){assert.equal(finales.get('op-d').estado,'cobrada');assert.equal(finales.get('op-d').progreso.introducido,500);assert.equal(finales.get('op-d').progreso.devuelto,180);
       // La máquina tardó 12 s: el cobro acaba bien, sin soltar la conexión, sin otra orden encima y avisando a la caja.
       assert.equal(finales.get('op-e').estado,'cobrada',finales.get('op-e').error);assert.equal(finales.get('op-e').progreso.introducido,450);

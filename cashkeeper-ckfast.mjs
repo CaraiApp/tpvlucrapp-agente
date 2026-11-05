@@ -34,6 +34,8 @@ export async function operarCkfast(op, avisar, { diario, orden, intervalo = 1000
     } while (Date.now() < limite);
     return terminar('error', 'No se ha confirmado el resultado en CKMonitor. Requiere conciliación; no repetir.', true);
   } catch (e) {
+    // Rechazada antes de tocar CKMonitor (el diario tiene otra operación pendiente): el motivo tal cual y sin incidencia (5-11).
+    if (e.rechazoSeguro && !enviado) return terminar('error', e.message, false);
     return terminar('error', 'Operación detenida. Revisa el diario y CKMonitor antes de volver a operar.', enviado || !!e.conciliar);
   } finally { liberar?.(); }
 }
