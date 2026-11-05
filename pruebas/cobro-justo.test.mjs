@@ -69,3 +69,17 @@ test('cierre en reposo sin describir nada y sin haber metido de más: no se inve
   assert.equal(r.estado, 'error');
   assert.equal(r.conciliar, true);
 });
+
+// Antes de dejar un cobro con vuelta para revisar, se le pregunta siempre a la máquina (0.8.13; Luis, 5-11): si su última
+// salida es la vuelta (lo metido menos lo cobrado) y no queda crédito, vale aunque el final describa cualquier otra cosa.
+test('la máquina real describe solo una parte de la vuelta (7,20 de 17,20) pero su última salida es la vuelta entera: cobrado', async () => {
+  const r = await cobrar([['107', ['2000', '280', '0']], ['108', ['720', '1720', '0']], ['100', ['0', '', '720', '1720', '2', '0']]], '1720', 280);
+  assert.equal(r.estado, 'cobrada');
+  assert.deepEqual({ introducido: r.progreso.introducido, devuelto: r.progreso.devuelto }, { introducido: 2000, devuelto: 1720 });
+});
+
+test('el final describe otra cosa y la última salida no es la vuelta: queda para revisar (no se inventa)', async () => {
+  const r = await cobrar([['107', ['2000', '280', '0']], ['108', ['720', '1720', '0']], ['100', ['0', '', '720', '1720', '2', '0']]], '1000', 280);
+  assert.equal(r.estado, 'error');
+  assert.equal(r.conciliar, true);
+});

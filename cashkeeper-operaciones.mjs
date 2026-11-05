@@ -73,9 +73,11 @@ export async function operarEnMaquina(m, op, avisar) {
       // a medias no cuadra y queda para revisar.
       const vueltaEntera = observado.devuelto > 0 && fin.error === 0 && fin.actual === observado.devuelto && fin.objetivo === observado.devuelto;
       // La máquina real, si el Disable le llega cuando ya ha pagado toda la vuelta, cierra en reposo sin describir nada (0 de 0;
-      // Kursaal, 5-11: 2,80 € con 20 €, se vio devolver 7,20 € y el billete de 10 € ya no avisó). Entonces se le pregunta a ella:
-      // la última salida (44) es la vuelta y no puede quedar crédito (43). Vale si lo metido menos esa vuelta es justo lo cobrado.
-      if (!justo && !vueltaEntera && [1, 2, 7].includes(fin.estado) && fin.error === 0 && fin.actual === 0 && fin.objetivo === 0 && objetivo > 0 && observado.introducido > objetivo) {
+      // Kursaal, 5-11: 2,80 € con 20 €, se vio devolver 7,20 € y el billete de 10 € ya no avisó), o describiendo solo una parte.
+      // Antes de dejar un cobro con vuelta para revisar, SIEMPRE se le pregunta a ella (Luis, 5-11: «esto no me puede pasar en
+      // medio del servicio»): la última salida (44) es la vuelta y no puede quedar crédito (43). Vale solo si lo metido (sus
+      // avisos 107) menos esa vuelta es justo lo cobrado; si no, sigue para revisar (nunca se inventa una vuelta).
+      if (!justo && !vueltaEntera && [1, 2, 7].includes(fin.estado) && fin.error === 0 && objetivo > 0 && observado.introducido > objetivo) {
         const salida = entero((await m.orden(44))[0]);
         const credito = entero((await m.orden(43, [255]))[0]);
         if (credito === 0 && salida >= observado.devuelto && observado.introducido - salida === objetivo) {
@@ -102,7 +104,8 @@ export async function operarEnMaquina(m, op, avisar) {
       const esperado = accion === 'cancelar' ? progreso.introducido : progreso.introducido - objetivo;
       // ValueOUT conserva el último pago: un cobro exacto no tiene vuelta que consultar.
       progreso.devuelto = conVuelta ? observado.devuelto : esperado === 0 && fin.estado !== 3 && observado.devuelto === 0 ? 0 : entero((await m.orden(44))[0]);
-      const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo || (conVuelta && fin.objetivo === progreso.devuelto) || (vueltaConsultada !== null && fin.actual === 0 && fin.objetivo === 0);
+      // Con la vuelta confirmada por la máquina (44 y crédito 0), lo que describa el final ya no manda.
+      const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo || (conVuelta && fin.objetivo === progreso.devuelto) || vueltaConsultada !== null;
       if (esperado < 0 || progreso.devuelto !== esperado || !terminalCoherente) throw revision('El efectivo recibido y la devolución no cuadran');
       await limpiarCreditoConfirmado(m, fin.operacion);
     }
