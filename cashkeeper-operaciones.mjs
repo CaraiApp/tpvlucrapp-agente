@@ -50,7 +50,7 @@ export async function operarEnMaquina(m, op, avisar) {
     });
     if (fin.cortada) throw revision('Se perdió la conexión durante el movimiento. Resultado incierto; no repetir.');
     if (eventoAjeno) throw revision('Se recibieron importes de otra operación');
-    let entrada; let conVuelta = false;
+    let entrada; let conVuelta = false; let vueltaConsultada = null;
     if (saca) progreso.devuelto = fin.actual;
     else if (fin.estado === 3) {
       // Disabled PAYING describe la vuelta, no el dinero introducido (§9.2.3).
@@ -72,7 +72,17 @@ export async function operarEnMaquina(m, op, avisar) {
       // vuelta coincidía con lo cobrado y no se distinguía). Vale si lo metido menos la vuelta es justo lo cobrado; una vuelta
       // a medias no cuadra y queda para revisar.
       const vueltaEntera = observado.devuelto > 0 && fin.error === 0 && fin.actual === observado.devuelto && fin.objetivo === observado.devuelto;
-      conVuelta = (justo || vueltaEntera) && objetivo > 0 && observado.devuelto > 0 && observado.introducido - observado.devuelto === objetivo;
+      // La máquina real, si el Disable le llega cuando ya ha pagado toda la vuelta, cierra en reposo sin describir nada (0 de 0;
+      // Kursaal, 5-11: 2,80 € con 20 €, se vio devolver 7,20 € y el billete de 10 € ya no avisó). Entonces se le pregunta a ella:
+      // la última salida (44) es la vuelta y no puede quedar crédito (43). Vale si lo metido menos esa vuelta es justo lo cobrado.
+      if (!justo && !vueltaEntera && [1, 2, 7].includes(fin.estado) && fin.error === 0 && fin.actual === 0 && fin.objetivo === 0 && objetivo > 0 && observado.introducido > objetivo) {
+        const salida = entero((await m.orden(44))[0]);
+        const credito = entero((await m.orden(43, [255]))[0]);
+        if (credito === 0 && salida >= observado.devuelto && observado.introducido - salida === objetivo) {
+          vueltaConsultada = salida; observado.devuelto = salida; progreso.devuelto = salida;
+        }
+      }
+      conVuelta = (justo || vueltaEntera || vueltaConsultada !== null) && objetivo > 0 && observado.devuelto > 0 && observado.introducido - observado.devuelto === objetivo;
       if (![1, 2, 7].includes(fin.estado) || (observado.introducido > fin.actual && !billeteDevuelto && !conVuelta)) throw revision('El final no corresponde a la entrada de efectivo');
       progreso.introducido = conVuelta ? observado.introducido : fin.actual;
     }
@@ -92,13 +102,13 @@ export async function operarEnMaquina(m, op, avisar) {
       const esperado = accion === 'cancelar' ? progreso.introducido : progreso.introducido - objetivo;
       // ValueOUT conserva el último pago: un cobro exacto no tiene vuelta que consultar.
       progreso.devuelto = conVuelta ? observado.devuelto : esperado === 0 && fin.estado !== 3 && observado.devuelto === 0 ? 0 : entero((await m.orden(44))[0]);
-      const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo || (conVuelta && fin.objetivo === progreso.devuelto);
+      const terminalCoherente = fin.estado === 3 ? fin.actual === progreso.devuelto && fin.objetivo === esperado : accion === 'cancelar' || fin.objetivo === objetivo || (conVuelta && fin.objetivo === progreso.devuelto) || (vueltaConsultada !== null && fin.actual === 0 && fin.objetivo === 0);
       if (esperado < 0 || progreso.devuelto !== esperado || !terminalCoherente) throw revision('El efectivo recibido y la devolución no cuadran');
       await limpiarCreditoConfirmado(m, fin.operacion);
     }
     const cancelada = accion === 'cancelar' || (abierta && fin.actual === 0);
     progreso.fase = cancelada ? 'cancelado' : 'hecho';
-    return avisar(cancelada ? 'cancelada' : 'cobrada', null, { ...progreso, fin, ...(entrada ? { entrada } : {}) }, { ...progreso });
+    return avisar(cancelada ? 'cancelada' : 'cobrada', null, { ...progreso, fin, ...(entrada ? { entrada } : {}), ...(vueltaConsultada !== null ? { vuelta: { valor: vueltaConsultada, fuente: 'valueout44' } } : {}) }, { ...progreso });
   } finally { m.off('107', meter); m.off('108', sacar); }
 }
 

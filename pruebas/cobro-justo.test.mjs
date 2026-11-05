@@ -51,3 +51,21 @@ test('la vuelta de 90 € que acaba en 80: queda para revisar', async () => {
   assert.equal(r.estado, 'error');
   assert.equal(r.conciliar, true);
 });
+
+test('cobro de 2,80 € con 20 € (máquina real, 5-11): cierra en reposo sin describir nada; la última salida (44) es la vuelta', async () => {
+  const r = await cobrar([['107', ['2000', '280', '0']], ['108', ['720', '1720', '0']], ['100', ['0', '', '0', '0', '1', '0']]], '1720', 280);
+  assert.equal(r.estado, 'cobrada');
+  assert.deepEqual({ introducido: r.progreso.introducido, devuelto: r.progreso.devuelto }, { introducido: 2000, devuelto: 1720 });
+});
+
+test('el mismo cierre en reposo, pero la máquina dice que solo pagó 7,20 €: queda para revisar', async () => {
+  const r = await cobrar([['107', ['2000', '280', '0']], ['108', ['720', '1720', '0']], ['100', ['0', '', '0', '0', '1', '0']]], '720', 280);
+  assert.equal(r.estado, 'error');
+  assert.equal(r.conciliar, true);
+});
+
+test('cierre en reposo sin describir nada y sin haber metido de más: no se inventa una vuelta', async () => {
+  const r = await cobrar([['107', ['280', '280', '0']], ['100', ['0', '', '0', '0', '1', '0']]], '0', 280);
+  assert.equal(r.estado, 'error');
+  assert.equal(r.conciliar, true);
+});

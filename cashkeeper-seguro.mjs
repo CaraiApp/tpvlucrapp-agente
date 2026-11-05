@@ -103,7 +103,11 @@ export class DiarioCashKeeper {
       let previo;
       try { previo = JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); } catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
       const conexion = op.tipo === 'mantenimiento' && ['conectar', 'desconectar'].includes(op.herramienta?.accion);
-      if (previo.maquina === maquina && !conexion && (!previo.final || previo.final.resultado?.conciliar)) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
+      // Aquí no se ha tocado la máquina: se rechaza sin crear otra incidencia (5-11, Kursaal: un cobro rechazado así dejaba su
+      // cuenta enganchada «pendiente de conciliación» hasta tocar la base). La que bloquea es la operación anterior.
+      if (previo.maquina === maquina && !conexion && (!previo.final || previo.final.resultado?.conciliar)) {
+        throw Object.assign(new Error('La máquina tiene otra operación pendiente de conciliación: resuélvela en CashKeeper → Incidencias y vuelve a cobrar. No se ha tocado la máquina.'), { rechazoSeguro: true });
+      }
     }
     if (op.reanudar) throw revision('Operación ya enviada sin evidencia local durable. Requiere conciliación; no repetir.');
     this.guardar(op.id, { id: op.id, huella, maquina, tipo: op.tipo, objetivo: op.importe_centimos, propina: op.propina_centimos ?? 0, iniciada: new Date().toISOString() });
