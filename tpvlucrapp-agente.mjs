@@ -28,7 +28,7 @@
 //   (--servicio: lo usa el arranque automático · --enlazar CÓDIGO y --instalar: instalación sin preguntas)
 // Con Node.js 18+ también vale (node tpvlucrapp-agente.mjs), pero entonces no arranca solo: se queda en la ventana.
 // =====================================================================================
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -43,8 +43,9 @@ import { actualizarWindows, detenerEjecutableWindows } from './instalacion-windo
 import { marcarCajon, seEstaActualizando, empezarActualizacion, esperarCajonLibre } from './en-marcha.mjs';
 import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
-import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
-const VERSION = "0.8.11";
+import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, recuperarRearmes, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
+import { actualizar, tocaActualizar, leerIntento, guardarIntento, limpiarDescargas } from './actualizacion.mjs';
+const VERSION = "0.8.13";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -633,7 +634,18 @@ export class MaquinaDirecta extends EventEmitter {
     this.fallos = 0;
     this.pausada = false;
     this.avisos = []; this.nivelesBajos = []; this.billetePendiente = false; this.pregunta = null; this.timerPregunta = null;
+    // Lo último que se le mandó y lo que contestó, tal cual (para no adivinar al revisar una incidencia; 5-11).
+    this.tramas = [];
   }
+
+  #trama(d, m) {
+    this.tramas.push({ t: new Date().toISOString(), d, m: String(m).slice(0, 120) });
+    if (this.tramas.length > 60) this.tramas = this.tramas.slice(-60);
+  }
+
+  /** Las últimas tramas (se vacían al empezar cada operación). */
+  tramasRecientes() { return this.tramas.slice(-40); }
+  vaciarTramas() { this.tramas = []; }
 
   get donde() {
     return `${this.host}:${this.puerto}`;
@@ -790,7 +802,9 @@ export class MaquinaDirecta extends EventEmitter {
       };
       tiempo = setTimeout(vencer, paciencia);
       this.esperando = e;
-      this.conexion.write(Buffer.from(`$${codigo}${parametros.length ? `|${parametros.join("|")}` : ""}#`, "latin1"));
+      const texto = `$${codigo}${parametros.length ? `|${parametros.join("|")}` : ""}#`;
+      this.#trama(">", texto);
+      this.conexion.write(Buffer.from(texto, "latin1"));
     });
   }
 
@@ -829,6 +843,7 @@ export class MaquinaDirecta extends EventEmitter {
       const inicio = mensaje.indexOf("$");
       if (inicio < 0) continue;
       const [codigo, ...p] = mensaje.slice(inicio + 1).split("|").map((x) => x.trim());
+      this.#trama("<", mensaje.slice(inicio) + "#");
       // Un mensaje que no se entiende no tapa los que vienen detrás (el siguiente puede ser el Disabled).
       try {
         this.#mensaje(codigo, p);
@@ -1006,6 +1021,7 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
     m.ocupada = true;
     m.evidenciaFin = null;
     m.raroEnOperacion = false;
+    m.vaciarTramas?.();
     const consulta = op.tipo === "prueba" || esConsultaHerramienta(op);
     let liberar; let iniciada = false; let enviado = false; let revision = false; let ultimoProgreso; let finalGuardada;
     let acabada = false; let ultimoAviso = Date.now(); let ultimoResultado;
@@ -1027,6 +1043,8 @@ export async function operarDirecto(op, avisar, { maquina, diario = diarioCajon 
         resultado = { ...(resultado ?? {}), conciliar: soloAjustes ? false : enviado || revision };
       }
       if (m.observaciones) resultado = { ...(resultado ?? {}), ...m.observaciones() };
+      // Con el final (y solo con él) van las tramas: lo que se le mandó y lo que contestó, para revisar sin adivinar.
+      if (estado !== "en_curso" && !consulta && m.tramasRecientes) resultado = { ...(resultado ?? {}), tramas: m.tramasRecientes() };
       const cuerpo = { estado, ...(error ? { error: String(error).slice(0, 300) } : {}), ...(resultado ? { resultado } : {}), ...(progreso ? { progreso } : {}) };
       if (iniciada && estado !== "en_curso" && !consulta) { diario.terminar(op.id, cuerpo); finalGuardada = cuerpo; }
       const respuesta = await avisar(estado, error, resultado, progreso);
@@ -1210,8 +1228,38 @@ async function procesarTrabajo(configuracion, trabajo) {
 }
 
 /** El bucle de siempre: recoge lo pendiente (espera hasta 25 s) y lo imprime; cada 5 minutos cuenta sus impresoras. */
+/** Lo que la plataforma dice del programa publicado (en cada latido): versión y de dónde se descarga. */
+let programaPublicado = null;
+let actualizando = false;
+const CARPETA_ACTUALIZACIONES = path.join(DATOS, "actualizaciones");
+
+/**
+ * De madrugada y sin nada en marcha en el cajón, si la plataforma publica una versión más nueva: se descarga, se comprueba
+ * y se instala sola (Luis, 5-11). Solo el programa instalado de Windows (el que arranca el sistema): una copia abierta a
+ * mano o el script con Node no se tocan.
+ */
+async function comprobarActualizacion() {
+  const version = programaPublicado?.version; const url = programaPublicado?.descargas?.windows;
+  if (!version || !url || actualizando || SISTEMA !== "windows" || !esPrograma) return;
+  if (path.resolve(process.execPath).toLowerCase() !== path.resolve(INSTALADO).toLowerCase()) return;
+  const marca = path.join(CARPETA_ACTUALIZACIONES, "ultimo-intento.json");
+  if (!tocaActualizar({ actual: VERSION, publicada: version, cajonEnMarcha: cajonEnMarcha.size > 0, ultimoIntento: leerIntento(marca) })) return;
+  actualizando = true;
+  try {
+    await actualizar({ version, url, carpeta: CARPETA_ACTUALIZACIONES, log, lanzar: async (destino) => {
+      const hijo = spawn(destino, ["--instalar"], { detached: true, stdio: "ignore", windowsHide: true });
+      hijo.unref();
+    } });
+    guardarIntento(marca, version, "lanzada");
+  } catch (error) {
+    log(`✗ Actualización a la ${version}: ${error.message}. Se vuelve a intentar mañana de madrugada.`);
+    guardarIntento(marca, version, String(error.message).slice(0, 200));
+  } finally { actualizando = false; }
+}
+
 async function trabajar() {
   log(`Agente de impresión ${VERSION} (${SISTEMA}, ${os.hostname()})`);
+  limpiarDescargas(CARPETA_ACTUALIZACIONES, VERSION);
   // La marca de «operación del cajón en marcha» se renueva mientras dure (sin renovar, el instalador la da por vieja).
   setInterval(() => { if (cajonEnMarcha.size > 0) marcarCajon(DATOS, true); }, 10_000);
   let ultimoLatido = 0;
@@ -1232,6 +1280,10 @@ async function trabajar() {
         const latido = await llamarApi(configuracion, "POST", "/latido", { version: VERSION, ...(impresoras ? { impresoras } : {}) });
         ultimoLatido = Date.now();
         mantenerMaquinas(latido.cajones_directos ?? []);
+        if (latido.programa?.version) {
+          if (programaPublicado?.version !== latido.programa.version && latido.programa.version !== VERSION) log(`Hay una versión nueva del programa (${latido.programa.version}): se instalará sola de madrugada, con el cajón libre`);
+          programaPublicado = latido.programa;
+        }
         const lista = latido.impresoras.map((i) => i.nombre).join(", ");
         log(`Conectado como «${latido.agente.nombre}» · ${impresoras?.length ?? 0} impresoras en el ordenador · asignadas: ${lista || "ninguna todavía"}`);
       }
@@ -1246,6 +1298,10 @@ async function trabajar() {
         await recuperarMantenimientosRevisados(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
           (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
           .catch(error => log(`CashKeeper: no se pudo aplicar la revisión del mantenimiento: ${error.message}`));
+        // Lo rearmado desde la caja (Luis, 5-11): el encargado decidió con la máquina delante; aquí solo se cierra el diario.
+        await recuperarRearmes(m, m, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
+          (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos))
+          .catch(error => log(`CashKeeper: no se pudo aplicar el rearme: ${error.message}`));
         if (diarioCajon.pendientesRecuperacion(m).length && !m.recuperando) {
           m.recuperando = true;
           void recuperarInterrupciones(m, m, diarioCajon,
@@ -1254,6 +1310,11 @@ async function trabajar() {
             .catch(e => log(`CashKeeper: recuperación pendiente: ${e.message}`)).finally(() => { m.recuperando = false; });
         }
       }
+      // Lo rearmado de los cajones con CKMonitor (sin conexión directa aquí): solo se cierra el diario.
+      await recuperarRearmes(null, null, diarioCajon, id => llamarApi(configuracion, "GET", `/cajon/${id}/revision`),
+        (id, datos) => llamarApi(configuracion, "POST", `/cajon/${id}/revision`, datos), [...maquinasDirectas.values()].map(m => ({ host: m.host, puerto: m.puerto })))
+        .catch(error => log(`CashKeeper: no se pudo aplicar el rearme: ${error.message}`));
+      void comprobarActualizacion();
       // Los cobros del cajón, cada uno por su lado (pueden tardar minutos): la impresión sigue mientras.
       for (const operacion of cajon) {
         if (cajonEnMarcha.has(operacion.id)) continue;

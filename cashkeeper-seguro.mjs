@@ -103,7 +103,11 @@ export class DiarioCashKeeper {
       let previo;
       try { previo = JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); } catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
       const conexion = op.tipo === 'mantenimiento' && ['conectar', 'desconectar'].includes(op.herramienta?.accion);
-      if (previo.maquina === maquina && !conexion && (!previo.final || previo.final.resultado?.conciliar)) throw revision('La máquina tiene una operación pendiente de conciliación. No repetir ni cambiar a CKFast.');
+      // Aquí no se ha tocado la máquina: se rechaza sin crear otra incidencia (5-11, Kursaal: un cobro rechazado así dejaba su
+      // cuenta enganchada «pendiente de conciliación» hasta tocar la base). La que bloquea es la operación anterior.
+      if (previo.maquina === maquina && !conexion && (!previo.final || previo.final.resultado?.conciliar)) {
+        throw Object.assign(new Error('La máquina tiene otra operación pendiente de conciliación: resuélvela en CashKeeper → Incidencias y vuelve a cobrar. No se ha tocado la máquina.'), { rechazoSeguro: true });
+      }
     }
     if (op.reanudar) throw revision('Operación ya enviada sin evidencia local durable. Requiere conciliación; no repetir.');
     this.guardar(op.id, { id: op.id, huella, maquina, tipo: op.tipo, objetivo: op.importe_centimos, propina: op.propina_centimos ?? 0, iniciada: new Date().toISOString() });
@@ -129,6 +133,21 @@ export class DiarioCashKeeper {
       catch { throw revision('Diario CashKeeper ilegible: requiere revisión'); }
     }).filter(x => x.maquina === maquina && x.tipo === 'mantenimiento' &&
       (!x.final || x.final.resultado?.conciliar || (x.revision?.resolucion === 'mantenimiento_revisado' && !x.revision.sincronizada)));
+  }
+  /**
+   * Lo que bloquea esta máquina (sin final, o para conciliar) y puede «rearmarse» desde la caja (Luis, 5-11: «rearmar la máquina
+   * directamente desde el TPV»): el encargado decide con la máquina delante y aquí solo se cierra el diario. Sin `op`, lo de
+   * todas las máquinas menos las que se pasan en `excluir` (las de CKMonitor no tienen conexión directa).
+   */
+  pendientesRearme(op, excluir = []) {
+    if (!fs.existsSync(this.directorio)) return [];
+    const maquina = op ? createHash('sha256').update(`${op.host.toLowerCase()}:${op.puerto}`).digest('hex') : null;
+    const fuera = new Set(excluir.map(x => createHash('sha256').update(`${x.host.toLowerCase()}:${x.puerto}`).digest('hex')));
+    return fs.readdirSync(this.directorio).filter(f => f.endsWith('.json')).map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(this.directorio, f), 'utf8')); }
+      catch { throw revision('Diario ilegible: requiere revisión'); }
+    }).filter(x => x.id && (maquina ? x.maquina === maquina : !fuera.has(x.maquina)) &&
+      (!x.final || x.final.resultado?.conciliar || (x.revision?.resolucion === 'rearme' && !x.revision.sincronizada)));
   }
   pendientesRecuperacion(op) {
     if (!fs.existsSync(this.directorio)) return [];
@@ -251,6 +270,43 @@ export async function recuperarMantenimientosRevisados(m, op, diario, consultar,
       }
     } finally { m.ocupada = false; liberar(); }
   });
+}
+/**
+ * Un rearme decidido en la caja (Luis, 5-11): el encargado, con PIN y un diagnóstico reciente de la máquina (en reposo, sin
+ * crédito, sin interrupción), dijo qué pasó («se cobró X y se devolvió Y», «no se movió nada»…) y la plataforma ya lo tiene.
+ * Aquí solo se cierra el diario (lo que bloqueaba cobros nuevos) después de comprobar otra vez la máquina: nunca se le manda
+ * una orden de dinero. Sin máquina (`m` null: cajones con CKMonitor), se cierra sin más (la máquina la lleva CKMonitor).
+ */
+export async function recuperarRearmes(m, op, diario, consultar, confirmar, excluir = []) {
+  const pendientes = diario.pendientesRearme(op, excluir);
+  if (!pendientes.length) return;
+  const trabajo = async () => {
+    const liberar = op ? diario.bloquear(op) : () => {};
+    if (m) m.ocupada = true;
+    try {
+      for (const anterior of pendientes) {
+        const r = await consultar(anterior.id);
+        if (r?.resolucion !== 'rearme' || r.id !== anterior.id || !r.revisada_en) continue;
+        if (m) await reposoSeguro(m);
+        let actual = diario.leer(anterior.id);
+        if (!actual) continue;
+        if (actual.revision?.resolucion !== 'rearme') {
+          const previo = actual.final ?? { estado: 'error', error: 'Sin final en el diario', resultado: {} };
+          const apuntar = r.decision === 'apuntar';
+          const final = { ...previo, estado: apuntar ? 'cobrada' : actual.tipo === 'mantenimiento' ? previo.estado : 'cancelada',
+            ...(apuntar || actual.tipo !== 'mantenimiento' ? { error: undefined } : {}),
+            progreso: { ...(previo.progreso ?? { objetivo: actual.objetivo ?? 0, introducido: 0, devuelto: 0 }), fase: apuntar ? 'hecho' : 'cancelado' },
+            resultado: { ...(previo.resultado ?? {}), conciliar: false, rearme: { decision: r.decision, revisada_en: r.revisada_en } } };
+          if (final.error === undefined) delete final.error;
+          actual = { ...actual, revision: { ...r, anterior: actual.final ?? null, aplicada_en: new Date().toISOString() }, final };
+          diario.guardar(anterior.id, actual);
+        }
+        if ((await confirmar(anterior.id, { estado: 1, credito: 0, interrumpida: false }))?.resuelta === true)
+          diario.guardar(anterior.id, { ...actual, revision: { ...actual.revision, sincronizada: true } });
+      }
+    } finally { if (m) m.ocupada = false; liberar(); }
+  };
+  return m ? m.enTurno(trabajo) : trabajo();
 }
 export async function inventario(m) {
   const [principal] = await m.orden(38);
