@@ -1,7 +1,88 @@
 // Operaciones físicas: ninguna respuesta OK sustituye a Disabled (§9.4.2).
 import { hastaDisabled, comprobarFin, limpiarCreditoConfirmado, confirmarCancelacionVacia, inventario, entero, revision, seleccion, estadoSiContesta } from './cashkeeper-seguro.mjs';
+import { clasificar, componerVuelta, TOPE_DE_SERIE, UMBRAL_DE_SERIE } from './cashkeeper-vuelta.mjs';
+import { niveles as vectorNiveles } from './cashkeeper-seguro.mjs';
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 const total = xs => xs.reduce((s, x) => s + x.valor * x.unidades, 0);
+
+/** Máximos (23), mínimo común de monedas (propiedad 18) y mínimos de billetes (8) de cada máquina, 10 minutos. */
+const configuracionesVuelta = new WeakMap();
+async function configuracionVuelta(m, valores) {
+  const guardada = configuracionesVuelta.get(m);
+  if (guardada && guardada.hasta > Date.now()) return guardada.datos;
+  const [maximos] = await m.orden(23, [valores.join(',')]);
+  const [minimo] = await m.orden(63, [18]);
+  const billetes = valores.filter((v) => v >= 500);
+  const [minimosBilletes] = billetes.length ? await m.orden(8, [billetes.join(',')]) : [''];
+  const datos = {
+    maximos: vectorNiveles(valores.join(','), maximos, 'EUR'),
+    minimoMonedas: entero(minimo, 1_000_000),
+    minimosBilletes: billetes.length ? vectorNiveles(billetes.join(','), minimosBilletes, 'EUR') : [],
+  };
+  configuracionesVuelta.set(m, { hasta: Date.now() + 10 * 60_000, datos });
+  return datos;
+}
+
+/**
+ * Lo que hace falta para componer la vuelta de un cobro con lo que sobra (0.8.15; Luis, 7-11): los niveles de ahora y los
+ * máximos y mínimos de la máquina. Si algo no se puede leer (otro modelo, otra divisa), null: la vuelta la da la máquina.
+ */
+async function prepararVuelta(m, ajustes) {
+  try {
+    const lectura = await inventario(m);
+    if (lectura.divisa !== 'EUR') return null;
+    const cambio = lectura.cambio.filter((x) => x.divisa === 'EUR' && Number.isSafeInteger(x.unidades));
+    if (cambio.length === 0) return null;
+    const configuracion = await configuracionVuelta(m, cambio.map((x) => x.valor));
+    return { clasificadas: clasificar(cambio, { ...configuracion, umbralPct: ajustes.umbral_pct ?? UMBRAL_DE_SERIE }), tope: ajustes.tope_piezas ?? TOPE_DE_SERIE };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Un cobro con la vuelta compuesta por el programa (0.8.15): la máquina cerró sin devolver (Totalize sin vuelta automática
+ * y Disable 9|0) con todo lo metido como crédito. Se comprueba el crédito, se apunta la deuda de la vuelta en el diario,
+ * se quita el crédito (52) y se paga la vuelta con las piezas elegidas (30 PaySpecific); si la máquina rechaza esas piezas
+ * al momento (no las tiene), la compone ella (29 Pay). Un pago parcial o un corte dejan la operación para revisar con lo
+ * entregado, como al cambiar efectivo. Nada se da por cobrado hasta el Disabled del pago.
+ */
+async function pagarVuelta(m, { fin, objetivo, observado, progreso, plan, contar, avisar }) {
+  if (![1, 2, 7].includes(fin.estado) || fin.error !== 0 || fin.actual < objetivo || observado.devuelto > 0) throw revision('El final no corresponde al cobro sin vuelta automática');
+  const [credito] = await m.orden(43, [fin.operacion]);
+  if (entero(credito) !== fin.actual || (observado.introducido > 0 && observado.introducido !== fin.actual)) throw revision('El crédito no coincide con lo metido');
+  await comprobarFin(m, fin);
+  progreso.introducido = fin.actual;
+  const entrada = { valor: fin.actual, operacion: fin.operacion, fuente: observado.introducido ? 'evento107' : 'valuein43' };
+  const vuelta = fin.actual - objetivo;
+  if (vuelta === 0) {
+    await limpiarCreditoConfirmado(m, fin.operacion);
+    progreso.fase = 'hecho';
+    return avisar('cobrada', null, { ...progreso, fin, entrada }, { ...progreso });
+  }
+  // La deuda de la vuelta queda en el diario antes de quitar el crédito de la máquina.
+  m.marcarRevision?.('vuelta_pendiente', { introducido: fin.actual, devuelto: 0 });
+  await limpiarCreditoConfirmado(m, fin.operacion);
+  let piezas = componerVuelta(vuelta, plan.clasificadas, { tope: plan.tope })?.piezas ?? null;
+  progreso.fase = 'pagando';
+  await contar().catch(() => {});
+  const intentar = (orden) => hastaDisabled(m, orden, () => contar().catch(() => {}));
+  let pagado;
+  try {
+    pagado = await intentar(() => (piezas ? m.orden(30, [piezas.map((x) => x.valor).join(','), piezas.map((x) => x.unidades).join(','), 0]) : m.orden(29, [vuelta, 0])));
+  } catch (e) {
+    // La máquina rechazó esas piezas al momento (32 no las tiene, 37 no disponible): no ha movido nada; la compone ella.
+    if (!piezas || ![32, 37].includes(e.codigo)) throw e;
+    piezas = null;
+    pagado = await intentar(() => m.orden(29, [vuelta, 0]));
+  }
+  if (!pagado.cortada) progreso.devuelto = pagado.actual;
+  await contar().catch(() => {});
+  await comprobarFin(m, pagado);
+  if (pagado.actual !== vuelta || pagado.objetivo !== vuelta) throw revision('Vuelta parcial: revisa el importe entregado y el pendiente');
+  progreso.fase = 'hecho';
+  return avisar('cobrada', null, { ...progreso, fin: pagado, entrada, vuelta_piezas: { piezas: piezas ?? [], compuesta: !!piezas } }, { ...progreso });
+}
 
 export async function operarEnMaquina(m, op, avisar) {
   if (op.tipo === 'prueba') return avisar('cobrada', null, { estado: m.estado });
@@ -11,6 +92,8 @@ export async function operarEnMaquina(m, op, avisar) {
   const objetivo = entero(op.importe_centimos) + entero(op.propina_centimos ?? 0);
   entero(objetivo);
   const abierta = op.tipo === 'entrada' && objetivo === 0;
+  // La vuelta con lo que sobra (0.8.15): solo en cobros, con el ajuste encendido y si se pudo leer la máquina; si no, como siempre.
+  const vueltaPlan = op.tipo === 'cobro' && !saca && op.vuelta?.sobrante === true && objetivo > 0 ? await prepararVuelta(m, op.vuelta) : null;
   const progreso = { fase: 'conectando', objetivo, introducido: 0, devuelto: 0 };
   let piezas;
   if (op.seleccion) {
@@ -36,7 +119,8 @@ export async function operarEnMaquina(m, op, avisar) {
       if (saca) { progreso.fase = 'pagando'; if(piezas) await m.orden(87,[piezas.map(x=>x.valor).join(','),piezas.map(x=>x.unidades).join(','),0]); else await m.orden(29, [objetivo, 0]); }
       else {
         if (op.tipo === 'entrada') { await m.orden(67); await m.orden(14); }
-        if (!abierta) await m.orden(42, [objetivo, 1]);
+        // Con la vuelta compuesta por el programa, Totalize sin vuelta automática: al llegar al importe se cierra con 9|0.
+        if (!abierta) await m.orden(42, [objetivo, vueltaPlan ? 0 : 1]);
         progreso.fase = 'esperando';
       }
     }, async () => {
@@ -49,10 +133,17 @@ export async function operarEnMaquina(m, op, avisar) {
       } else if (abierta && r?.terminar) {
         // Disable congela el importe antes de leerlo; no hay carrera con otra moneda.
         accion = 'aceptar'; await m.orden(9, [0]);
+      } else if (vueltaPlan && progreso.introducido >= objetivo) {
+        // Ya está todo: se cierra sin devolver y la vuelta la paga el programa con lo que sobra.
+        accion = 'cerrar'; await m.orden(9, [0]);
       }
     });
     if (fin.cortada) throw revision('Se perdió la conexión durante el movimiento. Resultado incierto; no repetir.');
     if (eventoAjeno) throw revision('Se recibieron importes de otra operación');
+    // La vuelta compuesta: se cerró con 9|0 (o la máquina cerró sola al llegar al importe sin devolver nada).
+    if (vueltaPlan && accion !== 'cancelar' && (accion === 'cerrar' || ([1, 2, 7].includes(fin.estado) && fin.error === 0 && fin.actual >= objetivo && observado.devuelto === 0))) {
+      return await pagarVuelta(m, { fin, objetivo, observado, progreso, plan: vueltaPlan, contar, avisar });
+    }
     let entrada; let conVuelta = false; let vueltaConsultada = null;
     if (saca) progreso.devuelto = fin.actual;
     else if (fin.estado === 3) {

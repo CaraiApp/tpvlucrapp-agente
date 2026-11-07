@@ -45,7 +45,7 @@ import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, recuperarRearmes, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
 import { actualizar, tocaActualizar, leerIntento, guardarIntento, limpiarDescargas } from './actualizacion.mjs';
-const VERSION = "0.8.14";
+const VERSION = "0.8.15";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
