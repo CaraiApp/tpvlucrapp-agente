@@ -24,7 +24,10 @@ export async function operarEnMaquina(m, op, avisar) {
   let eventoAjeno = false;
   const limite = Date.now() + 20 * 60_000;
   const contar = () => avisar('en_curso', null, null, { ...progreso });
-  const meter = p => { if (p.length!==3 || p[2]!=='0' || (Number(p[1])!==objetivo && !(op.tipo==='entrada' && Number(p[1])===0))) { eventoAjeno=true; return; } progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
+  // En una entrada abierta el objetivo lo pone lo que entra: la máquina real avisa el ValueIN con el objetivo igual a lo metido
+  // (Kursaal, 7-11: un billete de 20 € en una entrada que luego se canceló pasó por «importes de otra operación» y acabó en
+  // Incidencias; la máquina lo devolvió entero). Lo que sí es ajeno es otra operación (p[2]) o una trama mal formada.
+  const meter = p => { if (p.length!==3 || p[2]!=='0' || (Number(p[1])!==objetivo && !(op.tipo==='entrada' && (abierta || Number(p[1])===0)))) { eventoAjeno=true; return; } progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
   const sacar = p => { if (p.length!==3 || p[2]!=='0') { eventoAjeno=true; return; } progreso.devuelto = entero(p[0]); observado.devuelto = Math.max(observado.devuelto, progreso.devuelto); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
   m.on('107', meter); m.on('108', sacar);
   try {

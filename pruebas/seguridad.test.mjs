@@ -88,6 +88,28 @@ test('reinicio tras éxito repite el resultado, nunca el dinero', async t => { c
 test('crédito previo bloquea cobro y no descarta fondos', async t => { const e = entorno(t); e.maquina.credito = 200; const r = await ejecutar(op(), e); assert.equal(r.resultado.conciliar, true); assert.ok(!e.maquina.ordenes.some(x => [42, 52].includes(x[0]))); });
 test('recarga: ActivateRefillMode, Enable, Disable, Disabled y Discard; registra lo recibido', async t => { const e = entorno(t); const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ terminar: true })); assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.introducido, 500); assert.equal(e.maquina.credito, 0); assert.deepEqual(e.maquina.ordenes.filter(x => [67, 14, 9, 52].includes(x[0])).map(x => x[0]), [67, 14, 9, 52]); });
 test('cancelación comprueba lo devuelto antes de limpiar crédito', async t => { const e = entorno(t); const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true })); assert.equal(r.estado, 'cancelada'); assert.equal(r.progreso.devuelto, 500); });
+// 7-11 (Kursaal): en una entrada abierta cancelada con un billete de 20 € dentro, la máquina avisó el ValueIN con el objetivo
+// igual a lo metido y el programa lo tomó por «importes de otra operación» (Incidencias). Cancelar y que la máquina devuelva
+// lo mismo es una cancelación normal; otra operación en el ValueIN sigue siendo para revisar.
+function entradaCancelada(e, operacion = '0') {
+  const m = e.maquina, original = m.orden.bind(m);
+  m.orden = async (c, p = []) => {
+    if (c === 14) { m.antesDeEnviar?.(c); m.ordenes.push([c]); m.estado = 2; m.metido = m.credito = 2000; m.emit('107', ['2000', '2000', operacion]); return []; }
+    if (c === 9) { m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]); m.salida = 2000; m.credito = 0; m.emit('108', ['2000', '2000', '0']); m.fin(2000, 2000, 3); return []; }
+    return original(c, p);
+  };
+}
+test('entrada abierta: cancelar con un billete dentro y devolución entera es una cancelación normal', async t => {
+  const e = entorno(t); entradaCancelada(e);
+  const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true }));
+  assert.equal(r.estado, 'cancelada'); assert.equal(r.progreso.introducido, 2000); assert.equal(r.progreso.devuelto, 2000);
+  assert.equal((await ejecutar(op('salida', { id: 'siguiente' }), e)).estado, 'cobrada');
+});
+test('entrada abierta: un ValueIN de otra operación sigue yendo a revisión', async t => {
+  const e = entorno(t); entradaCancelada(e, '1');
+  const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true }));
+  assert.equal(r.estado, 'error'); assert.equal(r.resultado.conciliar, true);
+});
 for (const accion of ['cierre', 'recicladores']) test(`${accion}: traslado interno cuadra con niveles`, async t => { const e = entorno(t); const r = await ejecutar(op('mantenimiento', { herramienta: { accion, confirmado: true, conservar: [{ valor: 100, unidades: 4 }], dispositivo: 'todo' } }), e); assert.equal(r.estado, 'cobrada'); assert.equal(r.resultado.movimiento_interno, true); assert.equal(e.maquina.cambio, accion === 'cierre' ? 4 : 0); });
 test('retirada exige confirmación humana y solo resetea contador', async t => { const e = entorno(t); const r = await ejecutar(op('vaciado', { vaciar: 'monedas' }), e, () => ({ terminar: true })); assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.devuelto, 300); assert.equal(e.maquina.cambio, 10); assert.equal(e.maquina.recaudacion, 0); });
 test('retirada sin confirmar conserva bloqueo, no inventa cancelación física', async t => { const e = entorno(t); const r = await ejecutar(op('vaciado', { vaciar: 'monedas' }), e, () => ({ cancelar: true })); assert.equal(r.resultado.conciliar, true); assert.equal(e.maquina.recaudacion, 3); });
