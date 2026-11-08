@@ -83,3 +83,24 @@ test('el final describe otra cosa y la última salida no es la vuelta: queda par
   assert.equal(r.estado, 'error');
   assert.equal(r.conciliar, true);
 });
+
+// El primer billete de un cobro puede avisar con el objetivo aún a 0 (máquina real, Kursaal 8-11: 41,40 € con 42 €, el billete
+// de 20 € avisó «2000|0|0»): es nuestro, no de otra operación; lo confirman el final (PAYING: la vuelta de 0,60), el crédito
+// a 0 y la última salida (0.8.16). Hasta la 0.8.15 iba a Incidencias con el dinero dentro, la vuelta dada y la mesa abierta.
+test('cobro de 41,40 € con 42 € (máquina real, 8-11): el primer billete avisa con el objetivo a 0; cobrado sin revisión', async () => {
+  const r = await cobrar([['107', ['2000', '0', '0']], ['107', ['4000', '4140', '0']], ['107', ['4200', '4140', '0']], ['108', ['10', '60', '0']], ['108', ['60', '60', '0']], ['100', ['0', '', '60', '60', '3', '0']]], '60', 4140);
+  assert.equal(r.estado, 'cobrada');
+  assert.deepEqual({ introducido: r.progreso.introducido, devuelto: r.progreso.devuelto }, { introducido: 4200, devuelto: 60 });
+});
+
+test('un ValueIN con otro objetivo (ni el nuestro ni 0) sigue siendo de otra operación: para revisar', async () => {
+  const r = await cobrar([['107', ['2000', '1000', '0']], ['107', ['4200', '4140', '0']], ['108', ['60', '60', '0']], ['100', ['0', '', '60', '60', '3', '0']]], '60', 4140);
+  assert.equal(r.estado, 'error');
+  assert.equal(r.conciliar, true);
+});
+
+test('un ValueIN de otra operación (tercer campo) sigue siendo para revisar', async () => {
+  const r = await cobrar([['107', ['2000', '0', '7']], ['107', ['4200', '4140', '0']], ['108', ['60', '60', '0']], ['100', ['0', '', '60', '60', '3', '0']]], '60', 4140);
+  assert.equal(r.estado, 'error');
+  assert.equal(r.conciliar, true);
+});

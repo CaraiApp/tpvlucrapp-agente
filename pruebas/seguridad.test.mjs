@@ -88,6 +88,92 @@ test('reinicio tras éxito repite el resultado, nunca el dinero', async t => { c
 test('crédito previo bloquea cobro y no descarta fondos', async t => { const e = entorno(t); e.maquina.credito = 200; const r = await ejecutar(op(), e); assert.equal(r.resultado.conciliar, true); assert.ok(!e.maquina.ordenes.some(x => [42, 52].includes(x[0]))); });
 test('recarga: ActivateRefillMode, Enable, Disable, Disabled y Discard; registra lo recibido', async t => { const e = entorno(t); const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ terminar: true })); assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.introducido, 500); assert.equal(e.maquina.credito, 0); assert.deepEqual(e.maquina.ordenes.filter(x => [67, 14, 9, 52].includes(x[0])).map(x => x[0]), [67, 14, 9, 52]); });
 test('cancelación comprueba lo devuelto antes de limpiar crédito', async t => { const e = entorno(t); const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true })); assert.equal(r.estado, 'cancelada'); assert.equal(r.progreso.devuelto, 500); });
+// 7-11 (Kursaal): en una entrada abierta cancelada con un billete de 20 € dentro, la máquina avisó el ValueIN con el objetivo
+// igual a lo metido y el programa lo tomó por «importes de otra operación» (Incidencias). Cancelar y que la máquina devuelva
+// lo mismo es una cancelación normal; otra operación en el ValueIN sigue siendo para revisar.
+function entradaCancelada(e, operacion = '0') {
+  const m = e.maquina, original = m.orden.bind(m);
+  m.orden = async (c, p = []) => {
+    if (c === 14) { m.antesDeEnviar?.(c); m.ordenes.push([c]); m.estado = 2; m.metido = m.credito = 2000; m.emit('107', ['2000', '2000', operacion]); return []; }
+    if (c === 9) { m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]); m.salida = 2000; m.credito = 0; m.emit('108', ['2000', '2000', '0']); m.fin(2000, 2000, 3); return []; }
+    return original(c, p);
+  };
+}
+test('entrada abierta: cancelar con un billete dentro y devolución entera es una cancelación normal', async t => {
+  const e = entorno(t); entradaCancelada(e);
+  const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true }));
+  assert.equal(r.estado, 'cancelada'); assert.equal(r.progreso.introducido, 2000); assert.equal(r.progreso.devuelto, 2000);
+  assert.equal((await ejecutar(op('salida', { id: 'siguiente' }), e)).estado, 'cobrada');
+});
+test('entrada abierta: un ValueIN de otra operación sigue yendo a revisión', async t => {
+  const e = entorno(t); entradaCancelada(e, '1');
+  const r = await ejecutar(op('entrada', { importe_centimos: 0 }), e, () => ({ cancelar: true }));
+  assert.equal(r.estado, 'error'); assert.equal(r.resultado.conciliar, true);
+});
+// La vuelta con lo que sobra (0.8.15; Luis, 7-11): Totalize sin vuelta automática, Disable sin devolver al llegar al importe,
+// crédito comprobado y descartado, y la vuelta pagada por piezas (30) con las que están por encima del umbral de su máximo.
+function cobroConVueltaCompuesta(e, { metido = 500, niveles = { 100: 5, 50: 100, 20: 50, 10: 10 }, maximos = { 100: 60, 50: 120, 20: 60, 10: 60 }, minimo = 20, rechazar30 = false, sinMaximos = false } = {}) {
+  const m = e.maquina, original = m.orden.bind(m);
+  const valores = Object.keys(niveles).map(Number).sort((a, b) => a - b);
+  m.orden = async (c, p = []) => {
+    if (c === 38) return ['EUR', ''];
+    if (c === 79) return [valores.join(','), valores.map((v) => niveles[v]).join(','), valores.map(() => 'EUR').join(',')];
+    if (c === 19) return [String(p[0]).split(',').map((v) => niveles[Number(v)] ?? 0).join(',')];
+    if (c === 17) return ['EUR', '100', '3'];
+    if (c === 23) { if (sinMaximos) throw Object.assign(new Error('No soportado'), { codigo: 37 }); return [String(p[0]).split(',').map((v) => maximos[Number(v)] ?? 0).join(',')]; }
+    if (c === 63) return [String(minimo)];
+    if (c === 8) return [String(p[0]).split(',').map(() => '0').join(',')];
+    if (c === 42 && p[1] === 0) { m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]); m.estado = 2; m.objetivoPedido = Number(p[0]); m.metido = metido; m.emit('107', [String(metido), String(p[0]), '0']); return []; }
+    if (c === 9 && p[0] === 0 && m.objetivoPedido !== undefined) { m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]); m.credito = m.metido; m.salida = 0; m.fin(m.metido, m.objetivoPedido, 2); return []; }
+    if (c === 30) {
+      m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]);
+      if (rechazar30) throw Object.assign(new Error('No hay importe suficiente'), { codigo: 32 });
+      const pedido = String(p[0]).split(',').reduce((s, v, i) => s + Number(v) * Number(String(p[1]).split(',')[i]), 0);
+      m.salida = pedido; m.emit('108', [String(pedido), String(pedido), '0']); m.fin(pedido, pedido, 3); return [];
+    }
+    return original(c, p);
+  };
+}
+const ajusteVuelta = { sobrante: true, umbral_pct: 80, tope_piezas: 10 };
+test('vuelta con lo que sobra: 3,40 € con 5 € da 1,60 € en dos de 50 y tres de 20 (sin tocar el euro ni los 10 c, escasos)', async t => {
+  const e = entorno(t); cobroConVueltaCompuesta(e);
+  const r = await ejecutar(op('cobro', { importe_centimos: 340, vuelta: ajusteVuelta }), e);
+  assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.introducido, 500); assert.equal(r.progreso.devuelto, 160);
+  assert.deepEqual(r.resultado.vuelta_piezas, { piezas: [{ valor: 50, unidades: 2 }, { valor: 20, unidades: 3 }], compuesta: true });
+  assert.deepEqual(r.resultado.entrada, { valor: 500, operacion: 0, fuente: 'evento107' });
+  assert.equal(r.resultado.fin.estado, 3); assert.equal(r.resultado.fin.actual, 160);
+  const codigos = e.maquina.ordenes.map((x) => x[0]);
+  assert.ok(e.maquina.ordenes.some((x) => x[0] === 42 && x[2] === 0)); assert.ok(e.maquina.ordenes.some((x) => x[0] === 9 && x[1] === 0));
+  assert.ok(e.maquina.ordenes.some((x) => x[0] === 30 && x[1] === '50,20' && x[2] === '2,3'));
+  assert.ok(codigos.includes(52)); assert.ok(!codigos.includes(29)); assert.equal(e.maquina.credito, 0);
+});
+test('vuelta con lo que sobra: si la máquina rechaza las piezas al momento, la compone ella (29) y se cobra igual', async t => {
+  const e = entorno(t); cobroConVueltaCompuesta(e, { rechazar30: true });
+  const r = await ejecutar(op('cobro', { importe_centimos: 340, vuelta: ajusteVuelta }), e);
+  assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.devuelto, 160);
+  assert.deepEqual(r.resultado.vuelta_piezas, { piezas: [], compuesta: false });
+  assert.ok(e.maquina.ordenes.some((x) => x[0] === 29 && x[1] === 160));
+});
+test('vuelta con lo que sobra: importe justo, sin vuelta ni pago', async t => {
+  const e = entorno(t); cobroConVueltaCompuesta(e, { metido: 340 });
+  const r = await ejecutar(op('cobro', { importe_centimos: 340, vuelta: ajusteVuelta }), e);
+  assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.devuelto, 0); assert.equal(r.progreso.introducido, 340);
+  assert.ok(!e.maquina.ordenes.some((x) => [29, 30].includes(x[0]))); assert.equal(e.maquina.credito, 0);
+});
+test('vuelta con lo que sobra: si la máquina no da sus máximos, el cobro va como siempre (vuelta automática)', async t => {
+  const e = entorno(t); cobroConVueltaCompuesta(e, { sinMaximos: true });
+  const r = await ejecutar(op('cobro', { importe_centimos: 500, vuelta: ajusteVuelta }), e);
+  assert.equal(r.estado, 'cobrada');
+  assert.ok(e.maquina.ordenes.some((x) => x[0] === 42 && x[2] === 1)); assert.ok(!e.maquina.ordenes.some((x) => x[0] === 30));
+});
+test('vuelta con lo que sobra: un pago parcial de la vuelta queda para revisar, sin repetir', async t => {
+  const e = entorno(t); cobroConVueltaCompuesta(e);
+  const m = e.maquina, conPago = m.orden.bind(m);
+  m.orden = async (c, p = []) => { if (c === 30) { m.antesDeEnviar?.(c); m.ordenes.push([c, ...p]); m.salida = 100; m.emit('108', ['100', '160', '0']); m.fin(100, 160, 3); return []; } return conPago(c, p); };
+  const r = await ejecutar(op('cobro', { importe_centimos: 340, vuelta: ajusteVuelta }), e);
+  assert.equal(r.estado, 'error'); assert.equal(r.resultado.conciliar, true); assert.equal(r.progreso.devuelto, 100);
+  assert.equal(e.maquina.ordenes.filter((x) => [29, 30].includes(x[0])).length, 1);
+});
 for (const accion of ['cierre', 'recicladores']) test(`${accion}: traslado interno cuadra con niveles`, async t => { const e = entorno(t); const r = await ejecutar(op('mantenimiento', { herramienta: { accion, confirmado: true, conservar: [{ valor: 100, unidades: 4 }], dispositivo: 'todo' } }), e); assert.equal(r.estado, 'cobrada'); assert.equal(r.resultado.movimiento_interno, true); assert.equal(e.maquina.cambio, accion === 'cierre' ? 4 : 0); });
 test('retirada exige confirmación humana y solo resetea contador', async t => { const e = entorno(t); const r = await ejecutar(op('vaciado', { vaciar: 'monedas' }), e, () => ({ terminar: true })); assert.equal(r.estado, 'cobrada'); assert.equal(r.progreso.devuelto, 300); assert.equal(e.maquina.cambio, 10); assert.equal(e.maquina.recaudacion, 0); });
 test('retirada sin confirmar conserva bloqueo, no inventa cancelación física', async t => { const e = entorno(t); const r = await ejecutar(op('vaciado', { vaciar: 'monedas' }), e, () => ({ cancelar: true })); assert.equal(r.resultado.conciliar, true); assert.equal(e.maquina.recaudacion, 3); });

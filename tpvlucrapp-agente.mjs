@@ -45,7 +45,7 @@ import { recuperarInterrupciones } from './cashkeeper-recuperacion.mjs';
 import { operarEnMaquina } from './cashkeeper-operaciones.mjs';
 import { DiarioCashKeeper, herramienta, esConsultaHerramienta, reposoSeguro, recuperarCancelacionesVacias, recuperarMantenimientosRevisados, recuperarRearmes, inventario, niveles, entero } from './cashkeeper-seguro.mjs';
 import { actualizar, tocaActualizar, leerIntento, guardarIntento, limpiarDescargas } from './actualizacion.mjs';
-const VERSION = "0.8.13";
+const VERSION = "0.8.16";
 const API_POR_DEFECTO = "https://tpvlucrapp-backend-production.up.railway.app";
 const NOMBRE_TAREA = "TPV Lucrapp Agente";
 const ETIQUETA_MAC = "com.tpvlucrapp.agente";
@@ -640,11 +640,13 @@ export class MaquinaDirecta extends EventEmitter {
 
   #trama(d, m) {
     this.tramas.push({ t: new Date().toISOString(), d, m: String(m).slice(0, 120) });
-    if (this.tramas.length > 60) this.tramas = this.tramas.slice(-60);
+    // El principio de la operación no se pierde (7-11: en una entrada cancelada tras 44 s de sondeos faltaba el ValueIN del
+    // billete y no se pudo saber por qué fue a revisión): las 10 primeras tramas se conservan siempre.
+    if (this.tramas.length > 120) this.tramas = [...this.tramas.slice(0, 10), ...this.tramas.slice(-100)];
   }
 
-  /** Las últimas tramas (se vacían al empezar cada operación). */
-  tramasRecientes() { return this.tramas.slice(-40); }
+  /** Las tramas de la operación: las 10 primeras y las 30 últimas (se vacían al empezar cada operación). */
+  tramasRecientes() { return this.tramas.length <= 40 ? this.tramas.slice() : [...this.tramas.slice(0, 10), ...this.tramas.slice(-30)]; }
   vaciarTramas() { this.tramas = []; }
 
   get donde() {
