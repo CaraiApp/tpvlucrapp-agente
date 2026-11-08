@@ -109,8 +109,12 @@ export async function operarEnMaquina(m, op, avisar) {
   const contar = () => avisar('en_curso', null, null, { ...progreso });
   // En una entrada abierta el objetivo lo pone lo que entra: la máquina real avisa el ValueIN con el objetivo igual a lo metido
   // (Kursaal, 7-11: un billete de 20 € en una entrada que luego se canceló pasó por «importes de otra operación» y acabó en
-  // Incidencias; la máquina lo devolvió entero). Lo que sí es ajeno es otra operación (p[2]) o una trama mal formada.
-  const meter = p => { if (p.length!==3 || p[2]!=='0' || (Number(p[1])!==objetivo && !(op.tipo==='entrada' && (abierta || Number(p[1])===0)))) { eventoAjeno=true; return; } progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
+  // Incidencias; la máquina lo devolvió entero). Y un ValueIN con el objetivo a 0 es el nuestro con el objetivo aún sin poner:
+  // la máquina real lo manda así siempre en las entradas y, alguna vez, con el primer billete de un cobro (Kursaal, 8-11:
+  // 41,40 € con 42 €, el billete de 20 € avisó «2000|0|0», la máquina cobró y dio la vuelta de 0,60 € y el cobro acabó en
+  // Incidencias con la mesa abierta; 0.8.16). Lo que sí es ajeno es otra operación (p[2]), otro objetivo o una trama mal
+  // formada; lo metido lo confirma al final la propia máquina (su Disabled, el crédito 43 y la última salida 44).
+  const meter = p => { if (p.length!==3 || p[2]!=='0' || (Number(p[1])!==objetivo && Number(p[1])!==0 && !(op.tipo==='entrada' && abierta))) { eventoAjeno=true; return; } progreso.introducido = entero(p[0]); observado.introducido = Math.max(observado.introducido, progreso.introducido); progreso.fase = 'metiendo'; };
   const sacar = p => { if (p.length!==3 || p[2]!=='0') { eventoAjeno=true; return; } progreso.devuelto = entero(p[0]); observado.devuelto = Math.max(observado.devuelto, progreso.devuelto); progreso.fase = saca ? 'pagando' : 'devolviendo'; };
   m.on('107', meter); m.on('108', sacar);
   try {
