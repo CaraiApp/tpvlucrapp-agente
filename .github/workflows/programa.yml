@@ -123,6 +123,13 @@ jobs:
           # Con guion (v0.6.0-palomitas.1) es de pruebas: pre-release, fuera de «latest».
           PRUEBAS=""
           case "$GITHUB_REF_NAME" in *-*) PRUEBAS="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Programa del ordenador ${GITHUB_REF_NAME#v}" $PRUEBAS \
-            --notes "Se instala una vez y arranca solo con el ordenador; imprime en las impresoras instaladas en Windows o Mac y en las de red por IP; desde la 0.4.0, cobra el efectivo en el CashKeeper (CKMonitor con CKFast); desde la 0.6.0, también sin CKMonitor (conexión directa con la máquina)." \
-            tpvlucrapp-agente-windows.exe tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente-mac-intel.zip
+          ARCHIVOS="tpvlucrapp-agente-windows.exe tpvlucrapp-agente-mac-apple-silicon.zip tpvlucrapp-agente-mac-intel.zip"
+          # Si la versión ya existe (creada desde la web de GitHub, que crea la etiqueta al publicarla: así se puede sacar
+          # una versión desde el móvil, 8-11), solo se le suben los archivos; si no, se crea entera.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber $ARCHIVOS
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Programa del ordenador ${GITHUB_REF_NAME#v}" $PRUEBAS \
+              --notes "Se instala una vez y arranca solo con el ordenador; imprime en las impresoras instaladas en Windows o Mac y en las de red por IP; desde la 0.4.0, cobra el efectivo en el CashKeeper (CKMonitor con CKFast); desde la 0.6.0, también sin CKMonitor (conexión directa con la máquina)." \
+              $ARCHIVOS
+          fi
